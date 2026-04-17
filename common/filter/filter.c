@@ -30,7 +30,7 @@ void filter_free_relsets(merge_t *merge) {
 }
 
 /*--------------------------------------------------------------------*/
-void filter_dump_relsets(msieve_obj *obj, merge_t *merge) {
+void filter_dump_relsets(msieve_obj *obj, merge_t *merge, const char *suffix) {
 
 	uint32 i;
 	relation_set_t *relset_array = merge->relset_array;
@@ -38,7 +38,10 @@ void filter_dump_relsets(msieve_obj *obj, merge_t *merge) {
 	char buf[256];
 	FILE *cycle_fp;
 
-	sprintf(buf, "%s.cyc", obj->savefile.name);
+	if (suffix && suffix[0])
+		sprintf(buf, "%s.cyc%s", obj->savefile.name, suffix);
+	else
+		sprintf(buf, "%s.cyc", obj->savefile.name);
 	cycle_fp = fopen(buf, "wb");
 	if (cycle_fp == NULL) {
 		logprintf(obj, "error: can't open cycle file\n");
