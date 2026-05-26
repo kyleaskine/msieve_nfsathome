@@ -13,3 +13,8 @@ msieve
 *.qo
 *.so
 built
+msieve.dat
+msieve.dat.*
+msieve.fb
+msieve.log
+worktodo.ini
