@@ -323,7 +323,8 @@ all: $(COMMON_OBJS) $(QS_OBJS) $(NFS_OBJS) $(GPU_OBJS)
 clean:
 	cd cub && make clean WIN=$(WIN) WIN64=$(WIN64) && cd ..
 	rm -f msieve msieve.exe libmsieve.a $(COMMON_OBJS) $(QS_OBJS) \
-		$(COMMON_GPU_OBJS) $(NFS_OBJS) $(NFS_GPU_OBJS) $(NFS_NOGPU_OBJS) *.ptx *.fatbin
+		$(COMMON_GPU_OBJS) $(NFS_OBJS) $(NFS_GPU_OBJS) $(NFS_NOGPU_OBJS) *.ptx *.fatbin \
+		cub/.build_config
 
 #----------------------------------------- build rules ----------------------
 
@@ -366,5 +367,20 @@ lanczos_kernel.ptx: $(COMMON_GPU_HDR)
 lanczos_kernel.fatbin: $(COMMON_GPU_HDR)
 	$(NVCC) -arch sm_$(SM) -fatbin -DVBITS=$(VBITS) -o $@ $<
 
-cub/built:
-	cd cub && make WIN=$(WIN) WIN64=$(WIN64) VBITS=$(VBITS) sm=$(SM)0 && cd ..
+CUB_SRC_DEPS = cub/Makefile cub/spmv_engine.cu cub/spmv_engine.h \
+		cub/sort_engine.cu cub/sort_engine.h
+
+# Re-emit cub/.build_config whenever VBITS or SM changes so that cub/built
+# is invalidated and the .so files get rebuilt for the new architecture.
+# The conditional rewrite keeps the timestamp stable across unchanged builds.
+.PHONY: cub/.build_config_force
+cub/.build_config: cub/.build_config_force
+	@new="VBITS=$(VBITS) SM=$(SM)"; \
+	old=$$(cat $@ 2>/dev/null || true); \
+	if [ "$$new" != "$$old" ]; then \
+		echo "cub: build config changed ($$old -> $$new); rebuilding" >&2; \
+		echo "$$new" > $@; \
+	fi
+
+cub/built: $(CUB_SRC_DEPS) cub/.build_config
+	cd cub && make WIN=$(WIN) WIN64=$(WIN64) VBITS=$(VBITS) sm=$(SM) && cd ..
