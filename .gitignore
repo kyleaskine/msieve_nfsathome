@@ -19,3 +19,5 @@ msieve.fb
 msieve.log
 worktodo.ini
 *.zst
+download.sh
+*.gz
