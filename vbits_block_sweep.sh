@@ -21,6 +21,12 @@
 # Send back: bench_results.tar.gz
 
 set -e
+
+# msieve traps SIGINT for graceful shutdown and exits normally, which makes
+# bash treat Ctrl-C as handled and continue the loop. Trap it ourselves so
+# one Ctrl-C ends the whole sweep (after msieve finishes its shutdown).
+trap 'echo "sweep interrupted"; exit 130' INT TERM
+
 SM=${1:?usage: $0 <sm, e.g. 70> [vbits list, default "64 256"]}
 VBITS_LIST=${2:-"64 256"}
 OUT=bench_results
