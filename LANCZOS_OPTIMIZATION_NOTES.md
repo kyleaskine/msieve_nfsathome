@@ -603,3 +603,53 @@ Predictions to check against the Tesla V100 (sm_70, 6MB L2, 900GB/s HBM2):
 If (1)-(3) hold, the dynamic block_nnz formula's floor behavior is right
 for small-L2 cards and per-arch guidance becomes: big-L2 cards tune
 block_nnz, small-L2 cards raise VBITS.
+
+## 2026-06-11: Tesla V100 Results (small-L2 validation)
+
+V100-SXM2-32GB (sm_70, 6MB L2, 900GB/s HBM2), CUDA 12.1, 20.2M x 20.2M
+matrix, 2.244B sparse nnz, 111 nnz/col. Fresh-start 900s windows.
+Reference: user's 51h production solve = VBITS=64 default = 574 ms/iter.
+
+| VBITS | block_nnz | blocks | dims/s | ms/iter | host mem |
+|---:|---|---:|---:|---:|---|
+| 64  | default(1.75B) | 2 | 109.5 | 577 | 18.7 GB |
+| 64  | 512M | 5  | 115.5 | 547 | 19.1 GB |
+| 64  | 256M | 9  | 127.5 | 496 | 19.7 GB |
+| 64  | 128M | 18 | **141.9** | 445 | 21.2 GB |
+| 64  | 64M  | 35 | 136.2 | 464 | 23.9 GB |
+| 256 | default(1.75B) | 2 | FAILED internal check at shutdown | | 20.2 GB |
+| 256 | 512M | 5  | 256.1 | 997 | 20.5 GB |
+| 256 | 256M | 9  | **257.5** | 991 | 21.1 GB |
+| 256 | 128M | 18 | 246.3 | 1037 | 22.3 GB |
+| 256 | 64M  | 35 | 217.5 | 1173 | 24.7 GB |
+
+Prediction scorecard:
+1. "Flat curve, optimum at large blocks" — half right. VBITS=256 is flat
+   (512M-128M within 4%), as predicted (its windows can never fit 6MB L2).
+   VBITS=64 has a real curve: +30% at 128M (9.2MB window ~ 1.5x L2), so
+   partial L2 residency pays even on small-L2 cards.
+2. "VBITS=256 gap >> the 5070's +6%" — confirmed dramatically: best-vs-
+   best +81% (141.9 -> 257.5 dims/s). Pure transaction efficiency.
+3. "Total block_nnz gain 1.2-1.5x" — 1.30x at VBITS=64. Combined
+   VBITS=256 + tuned block_nnz vs the production config: 2.35x
+   (the 51h solve becomes ~22h).
+
+Dynamic formula validation: block_nnz = max(128M, (L2/2)/sizeof(v_t) *
+avg_col_weight) predicts: V100 v64 -> 128M (measured optimum, exact);
+V100 v256 -> 128M (within 4.4% of measured best); 5070 v64 -> 278M
+(~256M optimum, exact); 5070 v128/v256 -> 128M (measured optima, exact).
+Within ~5% of measured best on every card/VBITS tested. VALIDATED on
+two architectures at opposite ends of the L2 spectrum.
+
+Unified recommendation: VBITS=256 + dynamic block_nnz wins on both
+cards (5070: 1435 dims/s; V100: 257 dims/s) WHERE VRAM PERMITS — this
+20.2M matrix needs ~21GB at VBITS=256, so 12GB consumer cards must run
+VBITS=64 (+formula) for matrices this size.
+
+ANOMALY to investigate: v256 + default (2 blocks of ~1.75B nnz) failed
+the periodic consistency check during graceful shutdown on the V100
+("error: corrupt state"). All other v256 runs passed continuous checks
+for 8-10 min each. Could be the near-clamp 1.75B block size at VBITS=256
+on sm_70, or a shutdown-path quirk. The 5070 ran v256+default cleanly.
+Do not ship v256 near the 1.75B clamp until understood; the recommended
+formula values (128-256M) are unaffected.
