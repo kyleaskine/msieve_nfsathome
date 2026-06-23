@@ -653,3 +653,49 @@ for 8-10 min each. Could be the near-clamp 1.75B block size at VBITS=256
 on sm_70, or a shutdown-path quirk. The 5070 ran v256+default cleanly.
 Do not ship v256 near the 1.75B clamp until understood; the recommended
 formula values (128-256M) are unaffected.
+
+## Tuning Heuristic (validated 2026-06-11, RTX 5070 + Tesla V100)
+
+1. Use the largest VBITS that fits VRAM (256 where possible). Tuned
+   speed orders 256 >= 128 > 64 on every card tested; the advantage
+   grows as L2 shrinks (+6% on 48MB-L2 5070, +81% on 6MB-L2 V100).
+2. Set block_nnz = max(128M, (L2_size/2)/sizeof(v_t) * avg_col_weight).
+   Within ~5% of measured optimum on every tested card/VBITS.
+3. If VRAM is tight: raise block_nnz first (frees per-block rowptr
+   replicas and costs little speed at high VBITS); drop VBITS only as
+   a last resort (-45% on small-L2 cards).
+4. use_managed (matrix > VRAM): max VBITS + default/max block_nnz.
+   The bottleneck becomes matrix bytes streamed per dim of progress
+   = (4B*nnz + rowptr replicas)/VBITS — big VBITS divides it, big
+   blocks minimize replication. (Predicted, not yet benchmarked.)
+5. Never rebuild the .mat mid-solve (fresh random quadratic characters
+   = different matrix; checkpoints are only valid for the exact .mat
+   they started on).
+
+Anomaly follow-up: the v256 + default (1.75B, near-clamp) "corrupt
+state" failure on the V100 did NOT reproduce on rerun — clean halt,
+243.6 dims/s (1048 ms/iter), completing the v256 table (default costs
+~5% vs the 256M optimum; flat curve confirmed). Treated as a transient
+one-off; no config restriction, but if "corrupt state" ever appears
+again, capture the log and investigate the shutdown-path check.
+
+## Planned: VBITS=512 Test (2026-06-12)
+
+Code supports VBITS up to 512 (VWORDS=8 unrolls present; lanczos.h
+whitelist). Predictions to check, written before measurement:
+
+1. Speed: v512 ~= v256 + 0-8%. GPU memory moves in 32B sectors; v_t hits
+   exactly one sector at VBITS=256 (gather sector traffic per dim
+   plateaus there — v512 issues half the gathers but each is 2 sectors).
+   The remaining v512 gain is colidx/rowptr traffic halving per dim.
+   If correct, VBITS=256 is the efficiency sweet spot and 512 is only
+   worth it where its memory cost is free.
+2. Memory: vectors and the dense-row block double vs v256 (~+30% total
+   footprint). RTX 5070 + 9.5M C168 matrix: ~13GB needed vs 12GB card —
+   expect OOM (which is itself the answer for 12GB cards). V100-32GB +
+   20.2M matrix: ~30-31GB at large blocks — borderline; prefer
+   NNZ_LIST="default 512000000 256000000 128000000" and watch the new
+   per-run vram_*.log sampling (added to vbits_block_sweep.sh).
+
+Commands: 5070: build VBITS=512, run plain skip_matbuild (formula picks
+block size). V100: ./vbits_block_sweep.sh 70 512 with the NNZ_LIST above.
