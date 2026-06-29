@@ -13,6 +13,7 @@ msieve
 *.qo
 *.so
 built
+.build_config
 msieve.dat
 msieve.dat.*
 msieve.fb
