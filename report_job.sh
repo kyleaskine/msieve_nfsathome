@@ -30,8 +30,8 @@
 #
 #   PASTEBIN_USER_KEY=<user key>
 #
-# With user+pass the paste is unlisted and owned by your account; with only the
-# dev key it is an unlisted guest paste; with neither, upload is skipped and the
+# With user+pass the paste is public and owned by your account; with only the
+# dev key it is a public guest paste; with neither, upload is skipped and the
 # post is printed with a placeholder.
 
 set -uo pipefail
@@ -261,7 +261,7 @@ upload() {
     out=$(curl -s --max-time 120 https://pastebin.com/api/api_post.php \
             -d "api_dev_key=$key" \
             -d "api_option=paste" \
-            -d "api_paste_private=1" \
+            -d "api_paste_private=0" \
             -d "api_paste_expire_date=N" \
             -d "api_paste_format=text" \
             ${userkey:+-d "api_user_key=$userkey"} \
