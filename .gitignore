@@ -25,3 +25,4 @@ download.sh
 *.gz
 jobname.txt
 .pastebin_credentials
+bench/
