@@ -936,7 +936,8 @@ Streaming is ~3.8x faster than the best use_managed run. Managed
 matrix setup took 29 min at 128M blocks (5.6 min at 1.75B); pinning the
 streamed blocks took 3-41 s. Streamed bytes per iteration work out to
 30-35 GB/s in all three layouts, below the 48 GB/s measured alone (the
-matbuild job competing for host memory bandwidth may be part of it), so
+matbuild job competing for host memory bandwidth may be part of it; a
+2026-10-03 run reached ~50 GB/s with the same margin, see there), so
 these runs are copy-bound: speed follows streamed bytes per dimension.
 VBITS=128 wins by halving the vectors, which leaves more of the matrix
 resident; more staging buffers cost resident blocks. Density barely
@@ -1222,3 +1223,711 @@ bind at either VBITS (no note).
   that layout. The two runs are within 0.4% of each other, a rough
   measure of run-to-run noise.
 - Chosen for the real run: VBITS=256 single_copy=1 block_nnz=139000000.
+
+## 2026-10-03: RTX 5070, 25.2M-dim C190 streaming (and an RTX 3080)
+
+The upload counts and inferred PCIe rates in this section were revised in the
+October 4 storage review below. The measured solve times remain valid, but
+they do not establish that this run reached the PCIe limit.
+
+Production run on the 12GB RTX 5070 (WSL2), C190, TD=110 from a
+multi-density filter: 25,152,405 dims, 2.40B sparse nonzeros (95.5/col)
+after packing 128 dense rows. VBITS=128, single_copy=1, default
+block_nnz 100.2M (L2 fit; the 2*nrows floor of 50M didn't bind), 24
+blocks. 11015 MB free, 2687 MB of vectors, 11565 MB of blocks needed:
+12 of 24 blocks (5732 MB) streamed through 3 buffers of 478 MB.
+
+The binary was built 2026-09-25, before Review follow-up 2, so the
+WDDM margin was still 256MB (no "leaving N MB free" line; the budget
+only adds up with 256MB). Polyselect (msieve -npr, CPU only) ran on 8
+cores from ~15 minutes in to the end.
+
+Result: 197,688 iterations, Lanczos loop 11h45m10s (594.5 dims/s,
+BLanczosTime 42535; the 0.1% ETA said 12h06m), 32 dependencies,
+p89 * p102 on the first dependency, 12h20m total.
+
+Copy rate: 127.2 dims per iteration at 214 ms. With 3 slots the
+transpose reuses the last two streamed blocks, so about 22 x 478 MB =
+10.5 GiB (11.0 GB) is copied per iteration: ~50 GB/s, the 48 GB/s the
+standalone pinned test reached. So this run was copy-bound at the PCIe
+limit, and the SpMV work was hidden under the copies.
+
+### What this says about the C189 rates
+
+The C189 runs above implied lower copy rates, computed the same way:
+
+| C189 run (2026-09-25) | copied per iteration | dims/s | implied rate |
+|---|---:|---:|---:|
+| TD=90 VBITS=256 single_copy, 24 of 38 streamed | ~12.3 GB | 685 | ~33 GB/s |
+| TD=90 VBITS=256 two-copy, 24 of 29 | ~13.3 GB | 570 | ~30 GB/s |
+| TD=90 VBITS=128 single_copy, 7 of 23 | ~5.0 GB | 774-787 | ~31 GB/s |
+| TD=110/130 VBITS=128 single_copy | ~6.5-7.8 GB | 700-753 | ~38-43 GB/s |
+
+- Not the margin: this run had the same 256MB margin and ran at ~50.
+- Not CPU load as such: polyselect kept all 8 cores busy during this
+  run. Polyselect barely touches memory, though, and the first C189
+  runs shared the machine with a matbuild job that does. Host-memory
+  traffic slowing the DMA is still a plausible cause.
+- The TD=90 VBITS=128 run (the idle recheck at 787) streamed the
+  least of any run and may not have been copy-bound; then ~31 GB/s is
+  just its copy load, not a ceiling.
+- Not settled. To check on the next big job (a C191): bench_la.sh on
+  its matrix with the machine idle, then with a matbuild running.
+
+### The 1.5GB WDDM margin: measured ~10% on this matrix
+
+Estimated first (before the test) at ~25%, assuming 3 more streamed
+blocks with 3 buffers. Measured the same day with the rebuilt binary
+(current code), same matrix, bench_la.sh 300s windows, one run each,
+-t 8. ECM stage 2 (about 12 processes, ~1.6GB each) was running on the
+CPU for both; ~1.9-2.3GB of VRAM was used by other programs.
+
+| margin | streamed | buffers | copies/iter | ms/iter | dims/s | full ETA | peak VRAM |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1536MB (default) | 13 of 24 (6210 MB) | 2 | 25 | 253.5 | 501.9 | 13h55m | 11343 MiB |
+| 256MB (max_gpu_mem=10759) | 11 of 24 (5259 MB) | 2 | 21 | 230.7 | 551.7 | 12h40m | 11844 MiB |
+| production run above (old binary, ~256MB) | 12 of 24 (5732 MB) | 3 | 22 | 214 | 594.5 | 11h45m | |
+
+- The 1.5GB margin cost 9% in speed (10% in ETA). Less than estimated
+  because the planner falls back to 2 buffers in both cases, so only
+  two more blocks stream.
+- Implied copy rates (2n-1 copies with 2 buffers, 2n-2 with 3): ~49
+  GB/s at the 1.5GB margin, ~46 at 256MB (perhaps not fully copy-bound
+  there), ~51 in production.
+- The production run beat both, with one block more streamed than
+  the 256MB run. It had 3 buffers and only polyselect (light on
+  memory) on the CPU, against ECM stage 2 (heavy on memory) here. Its
+  number is the whole-run average, not a 5-minute window. Not
+  separable from these runs, but consistent with host-memory traffic
+  slowing the copies.
+- Correction: the current code counts the dense rows as 383MB where the
+  old binary counted ~639MB, so max_gpu_mem = free - 256 gives a true
+  256MB margin but a budget 256MB larger than the old binary's (7689
+  vs 7433), not the old budget exactly.
+- 5 minutes with ~380MB of VRAM free is not proof that a 12h run is
+  safe, but the production run went 11h45m at about the same fill with
+  no trouble. The faults on 2026-09-25 came with other programs
+  actively using the GPU.
+- Options: run with max_gpu_mem = free - 256 by hand, or lower
+  STREAM_MARGIN_WDDM (512MB would keep most of the gain). Not changed.
+
+### Revised estimates for 12GB cards (VBITS=128 single copy, ~48 GB/s)
+
+The 2026-10-01 estimates assumed ~33 GB/s and the 1.5GB margin; at
+~48 GB/s, still with the 1.5GB margin:
+- ~24-25M dims: 8.5-12h (measured, C189 and this run)
+- ~30M: ~18 GB copied per iteration, ~1 day (estimate)
+- 41.6M (the 5090's TD=130 matrix): 43-54 GB per iteration depending
+  on block size, ~3.5-4.5 days (estimate; the 5090 took 14h)
+- Hard limits: the vectors (~107 B/col at VBITS=128) and dense rows must
+  stay on the card, ~60M dims on 12GB; host RAM is similar at 80GB
+  (~4 B per nonzero for the host matrix plus a pinned copy of the
+  streamed part, ~50GB for the 41.6M matrix).
+
+### Host memory while building blocks
+
+gpu_matrix_init builds each block on the host before it goes to the
+card: an 8-byte-per-nonzero entries array (grown by doubling, so up to
+2x the block, and kept at the largest block's size), the radix sort's
+two 8-byte arrays (forward blocks only), and the packed block. That is
+~28-36 bytes per nonzero of the largest block on top of the host matrix,
+for example ~1GB at 28M, ~7-9GB at 250M and ~50-63GB at 1.75B: the cause
+of the out-of-memory kills seen when raising block_nnz by hand. It is
+gone once the solve starts; after that, larger blocks slightly shrink
+the pinned copy (fewer row-pointer arrays). Possible fix, not done:
+walking a forward block's columns in order already sorts each row's
+column indices, so a count-per-row pass plus a placement pass could
+write the CSR block directly (4 bytes per nonzero, no sort). The
+transpose blocks could be written directly the same way. Blocks would
+be byte-identical.
+
+### RTX 3080 (someone else's run, 2026-09-30)
+
+RTX 3080 10GB (sm_86, 5MB L2), WDDM (1.5GB margin), current code,
+VBITS=256 single_copy: 14,150,048 dims, 1.04B sparse nonzeros
+(73.4/col). block_nnz was the 2*nrows floor (28.3M; L2 fit far
+below, and msieve logged the slower-than-two-copies note). 37 blocks,
+15 streamed (2429 MB) through 2 buffers of 162 MB. Lanczos 8h49m,
+~446 dims/s, factored (p77 * p96).
+- Copies were ~8 GB/s (~4.5 GB per 572 ms iteration), well under PCIe
+  4.0, so this run was limited by the SpMV, not the copies.
+- The 3060 (3MB L2, nearly the same size matrix: 251 dims/s single
+  copy, resident) scaled by memory bandwidth (2.1x) and nonzeros puts
+  a resident 3080 at ~490, so streaming cost at most ~10% here.
+- Larger single-copy blocks would cut the row pointers (57 MB per
+  block, 2.1 GB in all) and so the streaming, but on the 3060 64M
+  blocks were 7% slower than the 26M floor, resident. Two copies were
+  24-32% faster on the 3060 but would need ~9 GB here and stream ~8 GB
+  per iteration. No sweep was run; the default is probably within ~10%
+  of the best on this card.
+
+## 2026-10-04: Storage review and next experiments
+
+Implemented actual transfer counters and three opt-in storage changes:
+`host_check=1`, `col24=1`, and `row16=1`. All three default off and can be
+combined. The matrix file and checkpoint formats are unchanged. Packed blocks
+are decoded directly by the CUDA kernels, with per-block/per-group fallbacks
+when a smaller representation cannot hold the data. Comparisons use the
+retained C190 matrix; results and validation follow below.
+
+### Correction to the inferred PCIe rates above
+
+The current scheduler retains blocks at both turnarounds, including the
+transpose-to-forward transition between iterations. Replaying the actual
+`sched_distance` and `stream_load` functions with CUDA calls mocked, for 360
+block/buffer combinations over five iterations, gives `2*(m-slots)` uploads
+per steady-state single-copy iteration when m > slots, not `2*m-(slots-1)`.
+Unequal block sizes require counting the actual bytes, not multiplying by the
+largest block. Initial loading and two-copy mode have different counts.
+
+For the current-code October 3 measurements, 13 streamed blocks and 2 slots
+mean 22 uploads, not 25; 11 blocks and 2 slots mean 18, not 21. The inferred
+rates are about 43.5 and 39.1 GB/s, respectively. With the same scheduling
+policy, the older production binary's 12 blocks and 3 slots would mean 18
+uploads, not 22, or about 42 GB/s. Therefore the earlier claim that C190 had
+demonstrably reached the PCIe limit is too strong. Actual HtoD byte counters
+and a GPU timeline should distinguish copy traffic from exposed copy stalls.
+
+### Storage opportunities measured on C190
+
+The logged 24 blocks contain 2,402,981,751 sparse entries and have widths
+766,448-1,150,002 columns. Their local column indices need only 20 or 21 bits.
+Using 24 bits instead of 32 saves 2.238 GiB across the full sparse matrix;
+20/21-bit packing would save 3.194 GiB. Decode inside SpMV to retain the space
+saving in both resident blocks and staging buffers. Wider blocks need a
+32-bit fallback. At the October 3 default sparse budget, a CPU replay of the
+planner with 24-bit columns reduces steady-state uploads from 10.27 to 5.98
+GiB per iteration. These are modeled byte counts, not measured speedups.
+
+The 24 full row-pointer arrays total 2.249 GiB. A read-only sample of the first
+real block reproduced its 100,176,700 nonzeros. Of its 128-row pointer groups,
+99.946% fit 16-bit offsets from a shared 32-bit base; the remaining groups
+need a 32-bit fallback. With groups of 32, 95.369% fit 8-bit offsets. A first
+16/32-bit implementation should save roughly 1.1 GiB across this layout,
+subject to measuring all blocks and including metadata and decode costs.
+
+After iteration 3, v0 is only the occasional integrity-check vector. Keeping
+it on the host and uploading into the existing, then-idle SpMV scratch vector
+reclaims 383.8 MiB at C190/VBITS=128, or about 1.24 GiB at 41.6M/VBITS=256.
+Preserve startup behavior, every integrity check, and checkpoint compatibility.
+
+### Future experiment: complete row slabs, one upload for both products
+
+For a vertical partition of A into complete row slabs A_r,
+
+    A^T (A x) = sum_r A_r^T (A_r x).
+
+A slab can stay in its staging buffer while both products run, then be
+discarded. This could reduce repeat matrix uploads and shrink the intermediate
+A*x vector. Column tiling within each slab is necessary to retain the current
+cache locality; it also adds output accumulation traffic and launches, so the
+net speedup must be measured. Size slabs by nonzeros to accommodate heavy rows.
+The identity does not apply independently to the current column slices:
+doing A_i^T(A_i*x_i) for each would omit cross-slice contributions.
+
+Keep this as a separate layout experiment after the smaller storage changes.
+Benchmark complete Lanczos iterations, include dense rows, and verify both
+matrix products and final dependencies before drawing speed conclusions.
+
+### Validation of the storage implementation
+
+- GPU products matched an independent CPU oracle at VBITS=64, 128, and 256:
+  all four combinations of column/row encoding, all three gather modes,
+  both directions, and 256/512/1024/2048-item tiles. Cases include empty rows,
+  an empty matrix, a 70,000-entry row forcing a wide offset group, and XOR
+  accumulation into a nonzero output. Host codec checks cover group/tail
+  boundaries, high 32-bit bases, and the largest 24-bit index.
+- At VBITS=128, full synthetic solves with both single-copy and two-copy
+  streaming recovered dependencies independently verified against the original
+  matrix, including the dense and removed rows. A checkpoint written by the
+  saved original binary resumed with all three options, then resumed again
+  in the original binary and completed with valid dependencies.
+- CUDA and CPU builds passed. No multi-GPU/MPI run or full C190 factorization
+  has been performed for these changes. Short C190 benchmark runs retain the
+  solver's scheduled integrity checks and its final check before checkpointing.
+
+Tests live in `tools/test_spmv_packed.cu` and `tools/test_lanczos_packed.py`.
+Integration artifacts from the passing run are in
+`bench/packed-validation-17etcn1i/`. Saved executables and build logs are in
+`bench/codex-20261004/`; benchmark results append to `bench/results.tsv`.
+An initial two-copy synthetic fixture stalled in the existing transpose
+planner: `block_nnz=150000` starts its integer growth search at 15 rows,
+and `5*(15/4)` is still 15. The fixture now uses 200000; production planning
+is unchanged, and the test harness kills its own process if a timeout cannot
+stop it gracefully.
+
+### Applying the results to other GPUs
+
+Column savings are one byte per eligible sparse entry, regardless of VBITS;
+the host check-vector saving is `number_of_columns * VBITS / 8` bytes per
+single-GPU solve. Row savings depend on the number of blocks and the frequency
+of wide offset groups. All three options preserve the existing block widths,
+so they can reduce storage without enlarging the active vector window.
+
+For the September 29 RTX 5090 layout, 4.69B sparse entries imply about 4.37 GiB
+saved by eligible 24-bit columns at VBITS=256, plus about 1.24 GiB from the
+check vector. This should be tested at the previously good 111M/139M block
+sizes before considering larger blocks merely to make the matrix fit.
+These are capacity estimates, not a measured speedup on the 5090. The 5070
+timings below do not establish the preferred settings on resident matrices,
+older GPUs, or multi-GPU solves; decoding and occasional vector transfers
+can cost time even when the storage reduction is useful.
+
+Under a fixed GPU budget the planner spends freed space on additional
+resident blocks, so peak VRAM need not fall. Compare the complete matrix/vector
+footprint and actual uploaded bytes per iteration as well as `nvidia-smi`.
+
+### C190 measurements, October 4-5
+
+RTX 5070 12GB under WSL, VBITS=128, `-t 8`, default block size 100,176,501,
+`single_copy=1 max_gpu_mem=9500` for every run. `bench_la.sh` uses 30 seconds
+of warmup and a 180-second measurement window, then stops for an integrity
+check and checkpoint. These are single-window measurements and projected
+iteration-only full-run times, not completed C190 solves. Startup time and
+other applications' VRAM use varied between runs.
+
+| Extra storage options | dims/s | ms/iteration | projected full ETA | streamed blocks/slots | actual uploaded MiB/iteration |
+|---|---:|---:|---:|---:|---:|
+| Original executable, none | 473.7 | 268.6 | 14h45m | 13/2 | not recorded |
+| `host_check=1` | 487.7 | 260.9 | 14h19m | 12/2 | 9557.054 |
+| `col24=1` (Oct 4) | 596.1 | 213.5 | 11h43m | 10/2 | 6120.901 |
+| `col24=1` (Oct 5 control) | 562.8 | 226.1 | 12h24m | 10/2 | 6120.901 |
+| `row16=1` | 484.0 | 262.9 | 14h26m | 12/2 | 8628.064 |
+| `col24=1 host_check=1` | 540.2 | 235.6 | 12h56m | 9/2 | 5355.789 |
+| `col24=1 row16=1 host_check=1` | 494.6 | 257.3 | 14h07m | 6/2 | 2688.854 |
+
+The original executable predates the counters; its upload estimate is about
+10.27 GiB/iteration. Column packing measured 19-26% higher throughput than
+the recorded baseline. The 2% row-only difference is too small to establish a speedup from
+one run, although the 1114.8 MiB reduction is exact to the logged precision.
+The 3% host-check-only difference is also modest; it does demonstrably free
+383.8 MiB and remove one streamed block under this budget.
+Together the encoded matrix saves 3406.5 MiB; the host check vector adds
+383.8 MiB, for about 3.70 GiB less total matrix/vector storage.
+The combined format is not the fastest of these runs despite uploading much
+less data; capacity savings alone do not establish a speed benefit.
+
+For this 5070/C190 setup, start with `col24=1` at the tested memory budget.
+It was the fastest measured setting in both runs. `host_check=1` is available
+for another 383.8 MiB of capacity; with column packing it saves 2.61 GiB in
+total, but it did not improve the measured speed. Its 4% gap to the same-day
+column-only control is smaller than the 5.6% change between the two
+column-only runs, so these samples do not establish a reliable slowdown.
+The saved and fresh builds have identical GPU kernel instructions.
+
+Keep `row16=1` as an optional capacity tradeoff: all three options saved
+3.70 GiB but ran slower than either column-packing configuration. Extra row
+decoding is a likely cost to profile before pursuing a faster decoder; lower
+upload volume by itself is not evidence of a faster solve. No default storage
+settings were changed.
+
+Reproduce a column-only window with the rebuilt `./msieve`:
+
+```bash
+./bench_la.sh -a 'single_copy=1 max_gpu_mem=9500 col24=1' -T 180 -W 30 -- -t 8
+```
+
+The cap is specific to this test setup. Use a suitable budget and measure on
+each other GPU. The counters used for these measurements count explicit matrix uploads,
+excluding the first three iteration products; they do not time copies or
+measure unified-memory migrations.
+
+An initial host-check-only run passed solver integrity and checkpointing but
+its timing result is excluded: editing `bench_la.sh` while Bash was still
+executing it broke the wrapper's final parsing. The benchmark script must
+remain unchanged during a run.
+
+## 2026-10-05: Claude review follow-up
+
+Claude's review found no packed-block correctness defect in the prior
+implementation. It identified an unsafe host-vector abstraction, gaps in the
+benchmark/test harness, unnecessary host work, and a plausible cause of the
+row16 slowdown. The changes below address those findings in source. Testing
+was initially held while the GPU was occupied, then resumed with the user's
+authorization. Correctness results and five completed C190 timing windows
+are recorded below. The last two windows ran after the user released the
+hardware again that evening. All planned local checks are complete. The
+existing `./msieve` has not been replaced. A copy is saved as
+`bench/codex-review-20261005/msieve-before-review-v128` for comparison.
+
+### Safety and measurement fixes
+
+- `v0` now has a separate check-vector representation. With `host_check=1`
+  it owns a plain pinned host buffer; every ordinary GPU vector owns real
+  device memory. The two inner-product call sites explicitly upload `v0`
+  into the idle SpMV scratch vector, with an operand-alias guard. Checkpoint
+  reads/writes use host storage directly, including host-buffer MPI gather
+  and scatter helpers. Generic vector operations no longer accept the previous
+  device-address-zero representation.
+- Device-to-host vector copies write directly to the requested destination,
+  eliminating the extra host copy when saving `v0`. Uploading the check buffer
+  also avoids copying it into scratch's host mirror. The stored checkpoint
+  field order and vector representation on disk are unchanged.
+- Transfer accounting moved out of the generic Lanczos loop into the GPU
+  forward/transpose pair. It excludes three initial pairs; a fresh solve's
+  initialization product is included in that warmup. It excludes the standalone
+  forward products used to validate dependencies. One final aggregate reports
+  every measured pair in the solve, including short benchmark runs; it is not
+  limited to the benchmark's timing window. Resident and managed-memory runs
+  produce no explicit-streaming summary.
+- `bench_la.sh -b` resolves the checked executable to an absolute path before
+  invocation. Each run records that path and SHA-256 in `executable.txt`, and
+  appends `binary_path` to its TSV row. A local bare name can no longer select
+  an unrelated executable on `PATH`.
+- The synthetic integration test creates its own input and polynomial, passes
+  `-i` and `-nf`, and runs in its private directory. Restart interoperability
+  uses completed periodic checkpoints: old binary finishes, new binary resumes
+  an earlier checkpoint and finishes, then old binary resumes the new checkpoint
+  and finishes. No progress-polling/SIGTERM race is involved. Each solve's
+  dependencies are independently checked against the original synthetic matrix.
+
+The earlier C190 table's copy figures came from the first measured iteration:
+those benchmark windows ended before the old logger's next 1024-iteration
+report. They are actual upload counts for that sampled pair, not whole-window
+averages. The new final aggregate resolves this limitation.
+
+### Host work and row decoding
+
+- Block packing zeros only column padding and raw row counts. The column
+  entries are fully overwritten, and compressed row packing writes its own
+  tail padding. For C190's roughly 2.4B entries this removes about 9.6 GB of
+  redundant zero writes with 32-bit columns, or 7.2 GB with 24-bit columns.
+- Two-copy row16 planning computes independent per-column counts with OpenMP,
+  using the requested `-t` count, before the serial prefix sum. It retains one
+  row-pointer work array; it does not allocate one large array per worker.
+  The serial prefix sum and size scan remain. Startup improvement is unmeasured.
+- The column width is stored once per block in the plan. Host and test packers
+  share `spmv_col24_put` with the decoder's header. Narrow row offsets are packed
+  and read through uint32 words, avoiding the uint16 pointer alias in autotuning
+  and preserving the little-endian storage layout.
+- Warpmerge, segscan and scatter now keep a sequential row cursor with the
+  current 128-pointer group's base and payload offset. It reloads those values
+  only on a group change. Initial binary search still uses random-access
+  decoding. Raw-pointer kernels retain direct reads. This targets repeated
+  metadata loads when blocks contain only a few entries per row.
+
+Row-group caching is a performance candidate, not a demonstrated speedup.
+Extra live registers and the group-boundary branch could offset its benefit,
+and 32-bit word loads may behave differently from 16-bit loads on each GPU.
+Compare a normal build against an otherwise identical SpMV build compiled with
+`-DSPMV_CACHE_ROW_GROUPS=0`; use separate clean build directories and saved
+executables so changing a compiler flag cannot accidentally reuse an old object.
+The previous binary is an additional comparison, but changes besides the cache
+mean it cannot isolate the cache's contribution.
+
+### Validation plan and scope
+
+1. Compile CPU and CUDA builds in separate directories. Run the fake-executable
+   regression in `tools/test_bench_la.py` and host codec checks, including narrow
+   tails, wide groups, and sequential/nonmonotone cursor accesses.
+2. Run the independent GPU SpMV oracle for VBITS 64, 128 and 256, with caching
+   enabled and disabled. Include a sanitizer pass for group/tail boundaries.
+3. Run `tools/test_lanczos_packed.py` from outside the job directory against the
+   saved original baseline. It covers full single-copy and two-copy streaming,
+   resident mode, both checkpoint directions, exact measured-pair counts, and
+   the absence of transfer messages for resident runs. MPI checkpoint paths
+   still require a separate MPI build/run; they have not been validated here.
+4. On an otherwise idle GPU, repeat C190 windows with `single_copy=1
+   max_gpu_mem=9500`, identical VBITS/block/kernel settings, and column-only,
+   column-plus-row, and all-three storage options. Compare cached/uncached
+   row16 at identical residency. Alternate controls and candidates; include
+   complete iteration time, upload bytes, staging/resident allocation, and
+   startup time. Test the 5090 and other GPUs separately before changing their
+   recommendations.
+
+All three storage flags remain opt-in. The complete-row-slab experiment above
+remains a separate future project; this follow-up does not implement it.
+
+### Review follow-up validation results
+
+Clean CPU, cached CUDA, and uncached CUDA builds passed at VBITS=128. Build
+artifacts and logs are under `bench/codex-review-20261005/{cpu,cached,uncached}/`
+and `bench/codex-review-20261005/build-*.log`. The uncached build compiles SpMV
+with `-DSPMV_CACHE_ROW_GROUPS=0`; its source is otherwise identical.
+
+- `tools/test_bench_la.py` passed both bare-name and absolute-path cases with
+  a conflicting executable on PATH and a directory containing spaces.
+- Host codec tests passed with optimization and strict aliasing enabled for
+  VBITS 64, 128 and 256, with the cache enabled and disabled.
+- All six GPU oracle runs passed all four storage formats, three gather modes,
+  both products, XOR accumulation and five matrix shapes. Compute Sanitizer
+  memcheck on the cached VBITS=128 test reported zero errors.
+- The cached VBITS=128 integration suite passed from `/tmp`, using its own
+  input and polynomial. All six full solves returned dependencies independently
+  verified against the original synthetic matrix: new single-copy streaming,
+  original baseline, new restart, original restart, new two-copy streaming,
+  and new resident mode. The old checkpoint at dimension 40,059 resumed with
+  the new binary; its checkpoint at 60,051 resumed in the old binary. Transfer
+  summaries contained the exact expected number of completed pairs, and the
+  resident run emitted none. Artifacts: `packed-validation-ro5lkykd/` under
+  the review directory; summary: `integration-cached-gpu.log`.
+- A CPU VBITS=128 full synthetic solve passed the independent dependency check
+  (`cpu-validation-6xvqdqym/`, `integration-cpu.log`). No MPI compiler is installed
+  here, so MPI build/runtime validation remains outstanding.
+
+An initial sandboxed integration attempt stopped at CUDA initialization before
+any GPU computation. Repeating with direct GPU access produced the passing
+results above; the failed attempt is retained in `integration-cached.log`.
+
+For the sm_120 512-item col24/row16 kernels, static resource inspection reports
+40 versus 38 registers for cached versus uncached segscan, and 26 versus 20
+for scatter; neither variant spills to local memory. Warpmerge uses 40 in both.
+These counts explain a possible tradeoff but do not establish a speed result.
+
+### C190 review follow-up measurements
+
+RTX 5070, VBITS=128, `single_copy=1 max_gpu_mem=9500`, default block size
+100,176,501, `-t 8`, 30-second warmup and 180-second timing windows. Each run
+completed its integrity check and checkpoint shutdown with status OK. These
+remain short-window measurements, not full C190 solves.
+
+| Storage options | Row-group cache | dims/s | ms/iteration | streamed blocks/slots | uploaded MiB/iteration | measured transfer pairs |
+|---|---|---:|---:|---:|---:|---:|
+| `col24=1` | irrelevant to raw rows | 611.1 | 208.2 | 10/2 | 6120.901 | 1034 |
+| `col24=1 row16=1 host_check=1` | enabled | 534.1 | 238.2 | 6/2 | 2688.854 | 898 |
+| `col24=1 row16=1 host_check=1` | disabled | 525.5 | 242.1 | 6/2 | 2688.854 | 894 |
+| `col24=1 row16=1` (evening) | enabled | 511.9 | 248.5 | 8/2 | 4033.282 | 860 |
+| `col24=1` (evening control) | irrelevant to raw rows | 613.6 | 207.4 | 10/2 | 6120.901 | 1031 |
+
+The cached all-three sample is 1.6% faster than its uncached counterpart. One
+pair with a difference this small does not establish a repeatable speedup.
+Both have identical block placement and copy counts. All 24 raw-row kernels
+also have identical instructions between these two builds, as checked by
+disassembly. The two column-only controls agree within 0.4%. Column-only
+remains the fastest configuration measured here, including the evening
+comparison: 613.6 versus 511.9 dims/s with column-plus-row packing (19.9%
+higher throughput). Column packing saves about 2.24 GiB of matrix storage;
+column-plus-row packing saves 3.33 GiB. The all-three representation saves
+about 3.70 GiB in matrix/vector storage and trades speed for capacity on this
+workload. These savings describe the total storage footprint; the planner
+spends freed space on more resident blocks, so peak allocated VRAM need not fall.
+
+Load-to-first-progress times were 79, 78, 152, 92 and 75 seconds respectively.
+Initial reported VRAM use was 2269, 2391, 2044, 3183 and 2448 MiB. The last two
+runs started at 22:34 and 22:39, roughly ten hours after the first three.
+Those differences and the single cached/uncached pair limit conclusions about
+small performance changes, even though the column-only controls agree closely.
+All five runs passed their checkpoint integrity checks; the independent
+correctness checks above also passed. These measurements apply to this
+5070/C190 setup, not to an untested 5090 or another matrix.
+
+Artifacts are in `bench/review-col24-control-a-20261005-120422/`,
+`bench/review-all3-cached-20261005-121236/`,
+`bench/review-all3-uncached-20261005-122118/`,
+`bench/review-col24-row16-cached-20261005-223420/`, and
+`bench/review-col24-control-b-20261005-223954/`; wrapper summaries are
+`bench/codex-review-20261005/bench-*.log`, and rows are in `bench/results.tsv`.
+The final benchmark exited at 22:44:43 local time on October 5. No test or
+benchmark launched by this review remains running.
+
+All planned local CPU/single-GPU correctness checks and these five benchmark
+windows are complete. MPI and measurements on other GPU models remain outside
+the validated results here. The tested review executable is
+`bench/codex-review-20261005/cached/msieve`; its code matches the working tree.
+The root `./msieve` still contains the pre-review implementation.
+
+For speed on this setup, retain `single_copy=1 col24=1` and the tested memory
+budget. Add `row16=1` and/or `host_check=1` when their additional capacity is
+useful; row-group caching has not closed the speed gap. These formats are
+chosen while loading and preparing the matrix for the GPU. The existing
+`.mat` remains reusable with `skip_matbuild=1`.
+
+## 2026-10-06: Profiling col24 on C190, two rejected forward kernels, review fixes
+
+Setup for every GPU run below unless stated: RTX 5070 under WSL, the C190
+matrix (25,152,405 dims, 2.40B sparse nonzeros after packing 128 dense rows),
+VBITS=128, `single_copy=1 max_gpu_mem=9500 col24=1 -t 8`, default block_nnz
+100,176,501 (24 blocks; 10 streamed through 2 buffers of 383 MB, 6120.9 MiB
+uploaded per iteration). Profiling used the October 5 review build,
+`bench/codex-review-20261005/cached/msieve`.
+
+### What the October 4-5 storage results mean
+
+Column packing changed which resource limits the run. Copy rates per
+iteration, from the transfer counters (the baseline from the October 4
+planner replay):
+
+| Storage | Uploaded/iteration | ms/iteration | Copy rate |
+|---|---:|---:|---:|
+| none (Oct 4 baseline) | ~11.0 GB | 268.6 | ~41 GB/s, close to the 44-48 GB/s the link reaches |
+| col24 | 6.42 GB | 208 | ~31 GB/s |
+| col24 + row16 + host_check | 2.82 GB | 238 | ~12 GB/s |
+
+The baseline was copy-bound; with col24 the copies have slack and the SpMV
+kernels set the pace (confirmed by the nsys trace below). row16 and
+host_check only save memory and uploads, so they could not help this run, and
+row16's decoding landed on the critical path: the October 5 noon pair (all
+three options vs col24 alone) was ~30 ms/iteration (~15%) slower. They pay
+only when a run is still copy-bound after col24. In practice col24 at the
+safer 9500 MB cap (611-640 dims/s) already matches the old binary's
+full-budget production run (594.5).
+
+Under WSL, CUDA reported 11003-11015 MB free in every run regardless of what
+else held VRAM (2.0-3.2 GB per nvidia-smi), so max_gpu_mem never adapts to
+other programs. The October 6 nsys run started with 3157 MiB in use by other
+programs and still ran at full speed, so the slow October 5 evening
+col24+row16 window (511.9, 3183 MiB in use) was probably row16 itself, not
+WDDM paging.
+
+### nsys: where a col24 iteration goes
+
+`bench/nsys-col24-20261006-111923/` (`col24.nsys-rep`, `col24.sqlite`):
+30 s capture starting 200 s after launch, 145 iterations, 206.4 ms/iteration,
+about 617 dims/s (matches the 611-614 October 5 windows). Integrity check
+passed at the SIGTERM.
+
+| Part | ms/iteration | Share | Launches |
+|---|---:|---:|---:|
+| forward SpMV (segscan) | 104.3 | 50.5% | 24 |
+| transpose SpMV (scatter) | 82.3 | 39.9% | 24 |
+| inner_prod (NxB * BxB) | 9.6 | 4.7% | 4.6 |
+| outer_prod (BxN * NxB) | 7.3 | 3.5% | 3 |
+| memset + mask | 2.0 | 1.0% | 4.6 |
+| **GPU busy** | **205.5** | **99.6%** | |
+
+- The compute stream was never idle waiting for a block copy (0.0 ms) and
+  idle 0.9 ms/iteration for the host. The copy engine was busy 125.5 ms per
+  iteration (61%) at 51.1 GB/s for 16 large uploads: the copies are hidden.
+- Kernels overlapping a copy averaged 4.5% (segscan) and 9% (scatter) longer,
+  but the wider middle blocks overlap copies more often, so streaming's
+  hidden cost is a few percent at most.
+- Forward time per block is flat at 4.2-4.6 ms across block widths of
+  0.77M-1.15M columns; transpose time grows with width, 3.2 to 3.6 ms.
+- Vector operations are 9% at VBITS=128 (vs ~19% at VBITS=256 on C170), so
+  fusing them would gain ~2% here.
+
+An ncu attempt that collected nothing (see below) still gave the longest
+col24 measurement: 1,459,296 dims in 38m58s, 624 dims/s, 203.9 ms/iteration,
+integrity check passed (`bench/ncu-col24-20261006-120244/`).
+
+### ncu: forward vs transpose on the same block
+
+`bench/ncu-col24-20261006-125449/` (`turnaround.ncu-repz`, `raw.csv`). ncu
+needs GPU performance counters; under WSL it fails with ERR_NVGPUCTRPERM
+until NVIDIA Control Panel > Desktop > Enable Developer Settings, then
+Developer > Manage GPU Performance Counters > allow all users, followed by
+`wsl --shutdown`. Profiled the last two forward and first two transpose
+launches of a steady-state iteration (`--kernel-name regex:"segscan|scatter"
+--launch-skip 262 --launch-count 4 --set full`). The first forward launch ran
+at 1.45 GHz and is excluded; the rest ran at 2.58 GHz. Block 23 (98.9M
+nonzeros, 766K columns) in both directions:
+
+| | Forward (segscan) | Transpose (scatter) |
+|---|---:|---:|
+| time | 4.12 ms | 3.28 ms |
+| DRAM read / write | 0.76 / 0.32 GB | 0.75 / 0.003 GB |
+| DRAM bandwidth | 262 GB/s (~40%) | 229 GB/s (~35%) |
+| L2 throughput | 51% | 64% |
+| L2 / L1 hit rate | 81% / 46% | 81% / 48% |
+| instructions | 935M | 453M |
+| issue slots active | 48% | 30% |
+| load/store pipe | 68% | 32% |
+| long-scoreboard share of stalls | 62.5% | 80.5% |
+| registers, achieved occupancy | 38, 93% | 20, 87% |
+
+- Neither kernel is bandwidth-bound; both are latency-bound on scattered
+  memory accesses at high occupancy.
+- The forward's rewrite of the full 25M-row output vector adds 0.32 GB of
+  DRAM writes per block, but DRAM stays at 40%, so it is not the limiter. A
+  forward kernel that walks two blocks per pass (to halve those rewrites)
+  would target the wrong cost; dropped.
+- The forward runs 2.06x the transpose's instructions for the same nonzeros,
+  from its segmented scan.
+- At VBITS=128 each random gather uses 14.2 of the 32 bytes fetched.
+
+### Two forward kernels tried and rejected
+
+Opt-in variants, both passing the CPU oracle at VBITS 64/128/256, a
+compute_75 PTX build (the pre-sm_80 path) and memcheck:
+- `spmv_kernel=red`: the scatter kernel's shape for the forward product.
+  Each group XORs x[col] straight into y[row] with an atomic, no scan,
+  SEGSCAN_UNROLL gathers issued ahead.
+- `spmv_kernel=ballot`: segscan with the row starts marked by one ballot, so
+  the scan shuffles only values; group 0 settles the carry from its own row,
+  and on sm_80+ `__reduce_max_sync` skips levels longer than the step's
+  longest run. About 12 shuffle instructions per step instead of 17.
+
+Same binary for all runs, ABCCBA order, 30 s warmup + 180 s windows, all
+integrity checks OK (rows in `bench/results.tsv`):
+
+| Forward kernel | Run 1 | Run 2 | Average dims/s | ms/iteration |
+|---|---:|---:|---:|---:|
+| segscan (current) | 629.1 | 640.2 | 634.7 | 198.8-202.3 |
+| ballot | 628.2 | 627.9 | 628.0 | 202.6-202.7 |
+| red | 481.7 | 482.1 | 481.9 | 263.9-264.1 |
+
+- red is 24% slower: about four atomics per step hit each output row, and L2
+  applies same-address atomics one after another.
+- ballot ties: the ballot, clz and max-reduce instructions cost what the
+  saved shuffles did. Shuffle count is not the limiter.
+- The forward's random accesses are gathers whose results the scan must wait
+  for; the transpose's random accesses are atomics it never waits on. That
+  matches the ncu stall profile and neither variant changes it.
+- Both were removed from the tree; the source, build and logs are in
+  `bench/claude-fwd-20261006/`. Untried: `-DSEGSCAN_UNROLL=8` (more gathers in
+  flight, at the cost of registers).
+- The segscan controls (629-640) came out above the October 5 col24 windows
+  (611-614) with the same kernel code; a fresh build with the current
+  compiler and less VRAM held by other programs (2.2-2.3 GB) can't be
+  separated.
+
+Conclusion for this card and matrix: nothing is idle, copies are hidden, and
+the two SpMV kernels are latency-bound near what this layout allows. The
+remaining identified upside is the forward product (at most ~0.8 ms x 24
+blocks, ~10%, if it matched the transpose) and ~2% from vector-op fusion.
+Matrix reordering remains the only large lever.
+
+VBITS=256 was not run on C190: at the 9500 MB cap its vectors take ~5.4 GB,
+its default blocks are half the size (twice the row-pointer arrays), and most
+of the matrix would stream, copy-bound again. On C189 before col24, VBITS=256
+got 685 dims/s against 787 for VBITS=128.
+
+### Review follow-up (October 6 /code-review)
+
+No high-severity findings. Fixed:
+1. A stop signal could fail the integrity check spuriously. The check is only
+   valid against a check vector more than three iterations old, but a
+   SIGINT/SIGTERM forced it at once: in iterations 1-3 (v0 still the
+   starting vector), within three iterations of a `-ncr` restart (v0 is the
+   vnext of the checkpoint iteration), and, by the same rule, within three
+   iterations of a periodic check or the dump-interval calibration (not
+   reproduced separately). msieve printed "error: corrupt state" and exited
+   -1 instead of checkpointing. In non-MPI builds
+   the stop now waits until the check vector is old enough (at most four
+   iterations), then checks, checkpoints and halts as before; MPI still stops
+   at once without a checkpoint. `tools/test_lanczos_interrupt.py` (CPU
+   builds, 600k-row synthetic job, `bench/claude-fixes-20261006/early-stop/`):
+   the old build failed both the start and the restart cases; the new one
+   halted at iteration 4 and at restart+4 with clean checkpoints, and the
+   deferred checkpoint resumed to dependencies verified against the original
+   matrix.
+2. The GPU oracle now covers a block 2^24 columns wide with indices at the
+   top of the range and with a 0xff high byte, the `spmv_col_bytes` 24-bit
+   cutoff (2^24 columns: 3 bytes; 2^24+1: 4), and the autotuner's size
+   computation. A deliberately broken device decoder (dropping bit 23 on the
+   GPU only) passed the host codec checks and failed the new case.
+3. CLAUDE.md no longer carries run status; it keeps the guidance and points
+   here.
+4. Cleanups: row16 payload and total-size arithmetic and the 24-bit cutoff
+   live in `spmv_format.h` (`spmv_row16_payload_bytes`,
+   `spmv_row16_bytes_from_last`, `spmv_col_bytes`); the autotuner copies one
+   header word to size the array; `col_region_bytes` replaces the duplicated
+   padding formula and a block's bytes are derived from its column and row
+   regions; `check_copyin`/`check_copyout` are only built without MPI;
+   `check_upload` exists only in CUDA builds (CPU builds use v0 directly).
+
+Validation: CPU and CUDA (sm_120, VBITS=128) builds in
+`bench/claude-fixes-20261006/` give exactly the review builds' warnings (95 and
+99); the oracle passes at VBITS 64/128/256; the interrupt test passes. MPI is
+still neither built nor run.
+
+Left open from the review: every SpMV kernel is compiled for all four storage
+formats (48 instances instead of 12, for every architecture); row16 planning
+scans all rows once per forward block on one thread and packing rebuilds the
+same pointer array; `bench_la.sh -b` hashes only the executable, so
+`CUDA_SINGLE_BINARY=0` builds would load the current directory's
+`spmv_engine.so`; col24 or row16 with an old `spmvlib=` engine exits even
+when no block would end up packed.
+
+The root `./msieve` (built 2026-10-05 05:54) predates the October 5 review
+follow-up and these fixes; rebuild before production runs.

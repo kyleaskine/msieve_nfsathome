@@ -18,6 +18,8 @@
 #   -W SECS   warmup after the first progress line (default 30)
 #   -g N      GPU index, passed to msieve and used for VRAM sampling (default 0)
 #   -n NAME   label for the run (default: derived from -d and -a)
+#   -b PATH   msieve executable (default ./msieve)
+#   -k        keep benchmark checkpoints for restart validation
 #   -F        full validation: after measuring, let Lanczos finish, then run
 #             the square root (-nc3) in the same directory and report the
 #             factors. All output (.dep etc.) stays in the bench directory
@@ -30,7 +32,8 @@
 #   ./bench_la.sh -d 90 -a "single_copy=1" -F
 #
 # One summary line per run is appended to bench/results.tsv; sparse_mb is
-# what the matrix takes on the card, streamed_mb what is copied in per pass.
+# what the matrix takes on the card, streamed_mb what lives on the host.
+# copied_mib_per_iter counts actual uploads after cache reuse, when available.
 
 density=""
 nc2_args=""
@@ -39,8 +42,10 @@ warmup=30
 gpu=0
 name=""
 full=0
+binary=./msieve
+keep_checkpoint=0
 
-while getopts "d:a:T:W:g:n:Fh" opt; do
+while getopts "d:a:T:W:g:n:b:Fkh" opt; do
     case $opt in
         d) density=$OPTARG ;;
         a) nc2_args=$OPTARG ;;
@@ -48,7 +53,9 @@ while getopts "d:a:T:W:g:n:Fh" opt; do
         W) warmup=$OPTARG ;;
         g) gpu=$OPTARG ;;
         n) name=$OPTARG ;;
+        b) binary=$OPTARG ;;
         F) full=1 ;;
+        k) keep_checkpoint=1 ;;
         *) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 1 ;;
     esac
 done
@@ -59,7 +66,13 @@ extra_opts=("$@")
 suffix=${density:+.$density}
 mat="msieve.dat.mat$suffix"
 cyc="msieve.dat.cyc$suffix"
-for f in "$mat" msieve.fb worktodo.ini ./msieve; do
+# Resolve the very file we validate. A bare -b name must not be searched
+# again on PATH, where an unrelated executable could have the same name.
+binary=$(realpath -- "$binary") || exit 1
+[ -f "$binary" ] && [ -x "$binary" ] || {
+    echo "error: $binary is not an executable file"; exit 1;
+}
+for f in "$mat" msieve.fb worktodo.ini; do
     [ -e "$f" ] || { echo "error: $f not found"; exit 1; }
 done
 
@@ -70,6 +83,8 @@ fi
 stamp=$(date +%Y%m%d-%H%M%S)
 dir="bench/$name-$stamp"
 mkdir -p "$dir"
+printf '%s\n' "$binary" > "$dir/executable.txt"
+sha256sum -- "$binary" >> "$dir/executable.txt"
 
 ln -s "$PWD/$mat" "$dir/msieve.dat.mat"
 [ -e "msieve.dat.mat.idx$suffix" ] && \
@@ -94,11 +109,12 @@ progress() {
 vram_base=$(vram)
 vram_peak=${vram_base:-0}
 echo "run:     $dir"
+echo "binary:  $binary"
 echo "matrix:  $mat${cyc:+ (cycles: $cyc)}"
 echo "args:    -nc2 \"skip_matbuild=1 $nc2_args\" -g $gpu ${extra_opts[*]}"
 echo "VRAM in use before start: ${vram_base:-?} MiB"
 
-./msieve -s "$dir/msieve.dat" -l "$dir/msieve.log" -g "$gpu" \
+"$binary" -s "$dir/msieve.dat" -l "$dir/msieve.log" -g "$gpu" \
     "${extra_opts[@]}" -nc2 "skip_matbuild=1 $nc2_args" \
     > "$dir/stdout.txt" 2> "$dir/stderr.txt" &
 pid=$!
@@ -174,13 +190,13 @@ rc=$?
 # integrity check) exit nonzero
 [ $rc -ne 0 ] && status=FAIL
 grep -qE 'error:|corrupt state' "$dir/stdout.txt" "$dir/msieve.log" 2>/dev/null && status=FAIL
-rm -f "$dir"/*.chk
+[ "$keep_checkpoint" = 1 ] || rm -f "$dir"/*.chk
 
 factors=-
 if [ $full = 1 ] && [ "$status" = OK ]; then
     if grep -q "recovered .* nontrivial dependencies" "$dir/msieve.log"; then
         echo "linear algebra done; running square root"
-        ./msieve -s "$dir/msieve.dat" -l "$dir/msieve.log" -g "$gpu" \
+        "$binary" -s "$dir/msieve.dat" -l "$dir/msieve.log" -g "$gpu" \
             "${extra_opts[@]}" -nc3 >> "$dir/stdout.txt" 2>> "$dir/stderr.txt"
         factors=$(grep -oE "p(rp)?[0-9]+ factor: [0-9]+" "$dir/msieve.log" | \
                   awk '{print $NF}' | paste -sd' ')
@@ -207,6 +223,8 @@ fi
 
 sparse_mb=$(grep -o 'sparse matrix memory use: [0-9.]* MB' "$dir/stdout.txt" | awk '{print $5}')
 streamed_mb=$(grep -o 'streamed from host memory: [0-9.]* MB' "$dir/stdout.txt" | awk '{print $5}')
+copied_mib=$(sed -n 's/.*matrix transfers: \([0-9.]*\) MiB\/iteration,.*/\1/p' "$dir/msieve.log" | tail -1)
+copy_calls=$(sed -n 's/.*MiB\/iteration, \([0-9.]*\) copies\/iteration.*/\1/p' "$dir/msieve.log" | tail -1)
 
 echo
 echo "status:               $status"
@@ -217,7 +235,8 @@ echo "ms per iteration:     $iter_ms (approx, VBITS-0.76 dims/iteration)"
 echo "sparse matrix on GPU: ${sparse_mb:--} MB (resident blocks + staging buffers)"
 # msieve reports 0.0 when nothing is streamed; only show real streaming
 awk -v s="${streamed_mb:-0}" 'BEGIN { exit !(s > 0) }' && \
-    echo "streamed from host:   $streamed_mb MB per pass"
+    echo "matrix held on host:  $streamed_mb MB"
+[ -z "$copied_mib" ] || echo "actual matrix copies: $copied_mib MiB/iteration ($copy_calls uploads)"
 echo "peak VRAM:            $vram_peak MiB (${vram_base:-?} MiB in use before start)"
 [ $full = 1 ] && echo "factors:              $factors"
 
@@ -225,7 +244,9 @@ results=bench/results.tsv
 [ -f $results ] || printf "date\tname\tdensity\targs\tstatus\tdims_per_sec\teta_full\tms_per_iter\tsparse_mb\tpeak_vram_mib\tbase_vram_mib\tfactors\tdir\tstreamed_mb\n" > $results
 # files from before streaming lack the last column
 head -1 $results | grep -q streamed_mb || sed -i '1s/$/\tstreamed_mb/' $results
-printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$stamp" "$name" \
+head -1 $results | grep -q copied_mib_per_iter || sed -i '1s/$/\tcopied_mib_per_iter\tcopy_calls_per_iter/' $results
+head -1 $results | grep -q binary_path || sed -i '1s/$/\tbinary_path/' $results
+printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$stamp" "$name" \
     "${density:-default}" "$nc2_args ${extra_opts[*]}" "$status" "$rate" \
     "$eta_fmt" "$iter_ms" "${sparse_mb:--}" "$vram_peak" "${vram_base:-?}" "$factors" "$dir" \
-    "${streamed_mb:--}" >> $results
+    "${streamed_mb:--}" "${copied_mib:--}" "${copy_calls:--}" "$binary" >> $results

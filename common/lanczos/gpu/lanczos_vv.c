@@ -29,6 +29,27 @@ void *vv_alloc(uint32 n, void *extra) {
 	return v;
 }
 
+/* A check buffer is deliberately not a gpuvec_t. Ordinary vector operations
+   always receive a real device allocation. */
+v_t *vv_alloc_check_host(uint32 n, void *extra) {
+	v_t *host;
+	if (!((gpudata_t *)extra)->host_check)
+		return NULL;
+	CUDA_TRY(cuMemHostAlloc((void **)&host, n * sizeof(v_t), 0))
+	return host;
+}
+
+void vv_free_check_host(v_t *host) {
+	CUDA_TRY(cuMemFreeHost(host))
+}
+
+void vv_upload_check(void *scratch_in, const v_t *host, uint32 n) {
+	gpuvec_t *scratch = (gpuvec_t *)scratch_in;
+	/* Scratch's host mirror is refreshed on demand by vv_copyout. Avoid
+	   copying this large host buffer a second time just to update it. */
+	CUDA_TRY(cuMemcpyHtoD(scratch->gpu_vec, host, n * sizeof(v_t)))
+}
+
 void vv_free(void *v_in) {
 
 	gpuvec_t *v = (gpuvec_t *)v_in;
@@ -53,8 +74,6 @@ void vv_copy(void *dest_in, void *src_in, uint32 n) {
 	gpuvec_t *src = (gpuvec_t *)src_in;
 	gpuvec_t *dest = (gpuvec_t *)dest_in;
 
-	/* memcpy(dest->host_vec, src->host_vec, n * sizeof(v_t)); */
-
 	CUDA_TRY(cuMemcpyDtoD(dest->gpu_vec, src->gpu_vec, n * sizeof(v_t)))
 }
 
@@ -62,9 +81,9 @@ void vv_copyout(v_t *dest, void *src_in, uint32 n) {
 
 	gpuvec_t *src = (gpuvec_t *)src_in;
 
-	CUDA_TRY(cuMemcpyDtoH(src->host_vec, src->gpu_vec, n * sizeof(v_t)))
-
-	if (dest != src->host_vec) memcpy(dest, src->host_vec, n * sizeof(v_t)); 
+	/* Copy directly to the requested host buffer; a second host-to-host
+	   copy is unnecessary, including when capturing the check vector. */
+	CUDA_TRY(cuMemcpyDtoH(dest, src->gpu_vec, n * sizeof(v_t)))
 }
 
 void vv_clear(void *v_in, uint32 n) {
@@ -73,7 +92,7 @@ void vv_clear(void *v_in, uint32 n) {
 
 	memset(v->host_vec, 0, n * sizeof(v_t));
 
-	CUDA_TRY(cuMemsetD8(v->gpu_vec, 0, n * sizeof(v_t)));
+	CUDA_TRY(cuMemsetD8(v->gpu_vec, 0, n * sizeof(v_t)))
 }
 
 void vv_xor(void *dest_in, void *src_in, uint32 n) {
@@ -584,8 +603,8 @@ void vv_mul_BxN_NxB(packed_matrix_t *matrix,
 		v_t tmp[VBITS];
 		uint32 i, j;
 
-		CUDA_TRY(cuMemcpyDtoH(x->host_vec, x->gpu_vec, n * sizeof(v_t)))
-		CUDA_TRY(cuMemcpyDtoH(y->host_vec, y->gpu_vec, n * sizeof(v_t)))
+		vv_copyout(x->host_vec, x, n);
+		vv_copyout(y->host_vec, y, n);
 		mul_BxN_NxB_cpu(x->host_vec, y->host_vec, xy, n);
 
 		CUDA_TRY(cuMemcpyDtoH(tmp, d->gpu_scratch, 

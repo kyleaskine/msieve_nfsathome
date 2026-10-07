@@ -28,6 +28,12 @@ typedef void (*spmv_engine_free_func)(void * e);
 typedef void (*spmv_engine_run_func)(void * e,
 				spmv_data_t * spmv_data);
 
+/* Optional new entry points; the original struct and functions keep their
+   ABI for external engines. col_bytes is 3 or 4; row_format is from
+   spmv_format.h. Both products use the same packed representation. */
+typedef void (*spmv_engine_run_packed_func)(void *e, spmv_data_t *data,
+				uint32_t col_bytes, uint32_t row_format);
+
 /* optional: kernel for the gather products (spmv_engine_run) */
 enum {
 	SPMV_KERNEL_AUTO = 0,	/* per block, from nonzeros per row */

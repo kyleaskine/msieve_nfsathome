@@ -184,10 +184,13 @@ COMMON_HDR = \
 	include/thread.h \
 	include/util.h
 
+# Keep the kernel source first: the PTX/fatbin recipes compile $<.
 COMMON_GPU_HDR = \
 	common/lanczos/gpu/lanczos_kernel.cu \
 	common/lanczos/gpu/lanczos_gpu.h \
-	common/lanczos/gpu/lanczos_gpu_core.h
+	common/lanczos/gpu/lanczos_gpu_core.h \
+	cub/spmv_engine.h \
+	cub/spmv_format.h
 
 COMMON_NOGPU_HDR = \
 	common/lanczos/cpu/lanczos_cpu.h
@@ -487,7 +490,7 @@ cub/sort_engine.o: cub/sort_engine.cu cub/sort_engine.h $(CUB_DEPS) \
 	$(NVCC) $(CUDA_FATBIN_GENCODE) $(CUDA_HOST_FLAGS) -O3 \
 		-I. -Icub -I"$(CUDA_ROOT)/include" -c -o $@ $<
 
-cub/spmv_engine.o: cub/spmv_engine.cu cub/spmv_engine.h $(CUB_DEPS) \
+cub/spmv_engine.o: cub/spmv_engine.cu cub/spmv_engine.h cub/spmv_format.h $(CUB_DEPS) \
 		cub/.build_config
 	$(NVCC) $(CUDA_FATBIN_GENCODE) $(CUDA_HOST_FLAGS) -O3 -DVBITS=$(VBITS) \
 		-I. -Icub -I"$(CUDA_ROOT)/include" -c -o $@ $<
@@ -512,7 +515,7 @@ lanczos_kernel_ptx_embed.c: lanczos_kernel.ptx $(BIN2C)
 else
 # cub/Makefile takes bare SM numbers, comma-separated (sm=86,120)
 cub/built: cub/Makefile cub/spmv_engine.cu cub/spmv_engine.h \
-		cub/sort_engine.cu cub/sort_engine.h cub/.build_config
+		cub/spmv_format.h cub/sort_engine.cu cub/sort_engine.h cub/.build_config
 	cd cub && make WIN=$(WIN) WIN64=$(WIN64) VBITS=$(VBITS) \
 		sm=$(subst $(space),$(comma),$(CUDA_ARCH_LIST)) && cd ..
 endif

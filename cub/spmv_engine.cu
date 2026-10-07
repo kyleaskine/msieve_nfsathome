@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include "spmv_engine.h"
+#include "spmv_format.h"
 
 #ifndef DISABLE_NVTX
 #include "nvtx3/nvToolsExt.h"
@@ -65,12 +66,23 @@ __device__ __forceinline__ v_t warp_xor_reduce(v_t v) {
     return v;
 }
 
+template<int ROW_FORMAT>
+__device__ __forceinline__ uint32_t csr_row(const uint32_t *p, uint32_t r) {
+    return ROW_FORMAT == SPMV_ROWS_BASE16 ? spmv_row16_at(p, r) : p[r];
+}
+
+template<int COL_BYTES>
+__device__ __forceinline__ uint32_t csr_col(const uint32_t *p, uint32_t j) {
+    return COL_BYTES == 3 ? spmv_col24_at(p, j) : p[j];
+}
+
 // upper_bound: find smallest r such that rowptr[r] > idx. Returns r in [1..num_rows]
+template<int ROW_FORMAT>
 __device__ __forceinline__ int csr_upper_bound(const uint32_t* rowptr, int num_rows, uint32_t idx) {
     int lo = 0, hi = num_rows;
     while (lo < hi) {
         int mid = (lo + hi) >> 1;
-        uint32_t v = rowptr[mid];
+        uint32_t v = csr_row<ROW_FORMAT>(rowptr, mid);
         if (v <= idx) lo = mid + 1; else hi = mid;
     }
     return lo;
@@ -82,7 +94,7 @@ __device__ __forceinline__ int csr_upper_bound(const uint32_t* rowptr, int num_r
 // Each thread processes a contiguous slice [tbegin, tend) of the flattened CSR
 // (i.e., the concatenation of all rows), emitting partial XORs per row using
 // atomics when crossing row boundaries.
-template<int TWarpItems>
+template<int TWarpItems, int COL_BYTES, int ROW_FORMAT>
 __global__ void csr_spmv_xor_warpmerge_kernel(const uint32_t* __restrict__ rowptr,
                                           const uint32_t* __restrict__ colidx,
                                           const v_t* __restrict__ x,
@@ -99,8 +111,9 @@ __global__ void csr_spmv_xor_warpmerge_kernel(const uint32_t* __restrict__ rowpt
     uint32_t seg_end = min(seg_begin + (uint32_t)TWarpItems, total_nnz);
 
     // Locate starting row
-    int row = csr_upper_bound(rowptr, num_rows, seg_begin) - 1;
-    uint32_t row_end = rowptr[row + 1];
+    int row = csr_upper_bound<ROW_FORMAT>(rowptr, num_rows, seg_begin) - 1;
+    spmv_row_cursor<ROW_FORMAT> rows(rowptr);
+    uint32_t row_end = rows.at(row + 1);
 
     uint32_t cur = seg_begin;
     while (cur < seg_end) {
@@ -109,7 +122,7 @@ __global__ void csr_spmv_xor_warpmerge_kernel(const uint32_t* __restrict__ rowpt
             // XOR all nz in [cur, segment_end) using warp-strided loads
             v_t acc = vt_zero();
             for (uint32_t j = cur + lane; j < segment_end; j += WARP_SIZE) {
-                int col = (int)colidx[j];
+                int col = (int)csr_col<COL_BYTES>(colidx, j);
                 vt_xor_inplace(acc, x[col]);
             }
             v_t sum = warp_xor_reduce(acc);
@@ -123,7 +136,7 @@ __global__ void csr_spmv_xor_warpmerge_kernel(const uint32_t* __restrict__ rowpt
             do {
                 ++row;
                 if (row >= num_rows) break;
-                row_end = rowptr[row + 1];
+                row_end = rows.at(row + 1);
             } while (row_end == cur); // skip empty rows
         }
     }
@@ -142,7 +155,7 @@ __global__ void csr_spmv_xor_warpmerge_kernel(const uint32_t* __restrict__ rowpt
 #define SEGSCAN_UNROLL 4
 #endif
 
-template<int TWarpItems>
+template<int TWarpItems, int COL_BYTES, int ROW_FORMAT>
 __global__ void csr_spmv_xor_segscan_kernel(const uint32_t* __restrict__ rowptr,
                                           const uint32_t* __restrict__ colidx,
                                           const v_t* __restrict__ x,
@@ -162,8 +175,9 @@ __global__ void csr_spmv_xor_segscan_kernel(const uint32_t* __restrict__ rowptr,
     if (seg_begin >= total_nnz) return;
     uint32_t seg_end = min(seg_begin + (uint32_t)TWarpItems, total_nnz);
 
-    int row = csr_upper_bound(rowptr, num_rows, seg_begin) - 1;
-    uint32_t row_end = rowptr[row + 1];
+    int row = csr_upper_bound<ROW_FORMAT>(rowptr, num_rows, seg_begin) - 1;
+    spmv_row_cursor<ROW_FORMAT> rows(rowptr);
+    uint32_t row_end = rows.at(row + 1);
 
     int carry_row = -1;
     unsigned long long carry = 0;
@@ -182,9 +196,9 @@ __global__ void csr_spmv_xor_segscan_kernel(const uint32_t* __restrict__ rowptr,
             vv[u] = 0;
             if (group < GROUPS && j < seg_end) {
                 while (row_end <= j)
-                    row_end = rowptr[++row + 1];
+                    row_end = rows.at(++row + 1);
                 rr[u] = row;
-                vv[u] = x[colidx[j]].w[word];
+                vv[u] = x[csr_col<COL_BYTES>(colidx, j)].w[word];
             }
         }
 
@@ -240,7 +254,7 @@ __global__ void csr_spmv_xor_segscan_kernel(const uint32_t* __restrict__ rowptr,
 // nonzero, one 64-bit word per lane; a warp-wide atomic then touches whole
 // v_t entries instead of scattered words. Each group walks rowptr forward
 // from the warp's starting row to track the row of its current nonzero.
-template<int TWarpItems>
+template<int TWarpItems, int COL_BYTES, int ROW_FORMAT>
 __global__ void csr_spmv_xor_scatter_kernel(const uint32_t* __restrict__ rowptr,
                                           const uint32_t* __restrict__ colidx,
                                           const v_t* __restrict__ x,
@@ -261,15 +275,16 @@ __global__ void csr_spmv_xor_scatter_kernel(const uint32_t* __restrict__ rowptr,
     if (seg_begin >= total_nnz) return;
     uint32_t seg_end = min(seg_begin + (uint32_t)TWarpItems, total_nnz);
 
-    int row = csr_upper_bound(rowptr, num_rows, seg_begin) - 1;
-    uint32_t row_end = rowptr[row + 1];
+    int row = csr_upper_bound<ROW_FORMAT>(rowptr, num_rows, seg_begin) - 1;
+    spmv_row_cursor<ROW_FORMAT> rows(rowptr);
+    uint32_t row_end = rows.at(row + 1);
 
     for (uint32_t j = seg_begin + group; j < seg_end; j += GROUPS) {
         while (row_end <= j)
-            row_end = rowptr[++row + 1];
+            row_end = rows.at(++row + 1);
 
         unsigned long long xv = x[row].w[word];
-        atomicXor(&y[colidx[j]].w[word], xv);
+        atomicXor(&y[csr_col<COL_BYTES>(colidx, j)].w[word], xv);
     }
 }
 
@@ -286,10 +301,22 @@ enum { K_WARPMERGE, K_SEGSCAN, K_SCATTER };
 #define SEGSCAN_MAX_ROW_MEAN 8
 #endif
 
-static void spmv_autotune(SpmvEngine* eng, const uint32_t* d_rowptr, int num_rows) {
+static void spmv_autotune(SpmvEngine* eng, const uint32_t* d_rowptr, int num_rows, uint32_t row_format) {
     if (eng->tuned || num_rows <= 0) return;
     std::vector<uint32_t> h_rowptr(num_rows + 1);
-    cudaMemcpy(h_rowptr.data(), d_rowptr, (num_rows + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    if (row_format == SPMV_ROWS_BASE16) {
+        // the last group's header word locates the end of the array
+        uint32_t last;
+        cudaMemcpy(&last, d_rowptr + 2 * spmv_row_groups(num_rows) - 1,
+                   sizeof(uint32_t), cudaMemcpyDeviceToHost);
+        size_t bytes = spmv_row16_bytes_from_last(num_rows, last);
+        std::vector<uint32_t> packed((bytes + 3) / 4);
+        cudaMemcpy(packed.data(), d_rowptr, bytes, cudaMemcpyDeviceToHost);
+        for (int r = 0; r <= num_rows; r++)
+            h_rowptr[r] = spmv_row16_at(packed.data(), r);
+    } else {
+        cudaMemcpy(h_rowptr.data(), d_rowptr, ((size_t)num_rows + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    }
 
     const uint64_t total_nnz = h_rowptr[num_rows];
     if (total_nnz == 0) {
@@ -383,32 +410,53 @@ SPMV_API void spmv_engine_set_kernel(void* e, int kernel) {
 
 SPMV_API void spmv_engine_free(void* e) { delete reinterpret_cast<SpmvEngine*>(e); }
 
-template<int TWarpItems>
-static void spmv_launch(int kernel, int blocks, int tpb, const uint32_t* rowptr,
+template<int TWarpItems, int COL_BYTES, int ROW_FORMAT>
+static void spmv_launch_format(int kernel, int blocks, int tpb, const uint32_t* rowptr,
                         const uint32_t* colidx, const v_t* x, v_t* y,
                         int num_rows, uint32_t total_nnz) {
     // the cache preference never changes, so set it once per kernel
     static bool configured[3] = { false, false, false };
     if (!configured[kernel]) {
         if (kernel == K_SCATTER)
-            cudaFuncSetCacheConfig(csr_spmv_xor_scatter_kernel<TWarpItems>, cudaFuncCachePreferL1);
+            cudaFuncSetCacheConfig(csr_spmv_xor_scatter_kernel<TWarpItems, COL_BYTES, ROW_FORMAT>, cudaFuncCachePreferL1);
         else if (kernel == K_SEGSCAN)
-            cudaFuncSetCacheConfig(csr_spmv_xor_segscan_kernel<TWarpItems>, cudaFuncCachePreferL1);
+            cudaFuncSetCacheConfig(csr_spmv_xor_segscan_kernel<TWarpItems, COL_BYTES, ROW_FORMAT>, cudaFuncCachePreferL1);
         else
-            cudaFuncSetCacheConfig(csr_spmv_xor_warpmerge_kernel<TWarpItems>, cudaFuncCachePreferL1);
+            cudaFuncSetCacheConfig(csr_spmv_xor_warpmerge_kernel<TWarpItems, COL_BYTES, ROW_FORMAT>, cudaFuncCachePreferL1);
         configured[kernel] = true;
     }
 
     if (kernel == K_SCATTER) {
-        csr_spmv_xor_scatter_kernel<TWarpItems><<<blocks, tpb>>>(rowptr, colidx, x, y, num_rows, total_nnz);
+        csr_spmv_xor_scatter_kernel<TWarpItems, COL_BYTES, ROW_FORMAT><<<blocks, tpb>>>(rowptr, colidx, x, y, num_rows, total_nnz);
     } else if (kernel == K_SEGSCAN) {
-        csr_spmv_xor_segscan_kernel<TWarpItems><<<blocks, tpb>>>(rowptr, colidx, x, y, num_rows, total_nnz);
+        csr_spmv_xor_segscan_kernel<TWarpItems, COL_BYTES, ROW_FORMAT><<<blocks, tpb>>>(rowptr, colidx, x, y, num_rows, total_nnz);
     } else {
-        csr_spmv_xor_warpmerge_kernel<TWarpItems><<<blocks, tpb>>>(rowptr, colidx, x, y, num_rows, total_nnz);
+        csr_spmv_xor_warpmerge_kernel<TWarpItems, COL_BYTES, ROW_FORMAT><<<blocks, tpb>>>(rowptr, colidx, x, y, num_rows, total_nnz);
     }
 }
 
-static void spmv_run_common(void* e, spmv_data_t* spmv_data, bool trans) {
+template<int TWarpItems>
+static void spmv_launch(int kernel, int blocks, int tpb, const uint32_t* rowptr,
+                        const uint32_t* colidx, const v_t* x, v_t* y,
+                        int num_rows, uint32_t total_nnz, uint32_t col_bytes,
+                        uint32_t row_format) {
+#define LAUNCH_FORMAT(C, R) spmv_launch_format<TWarpItems, C, R>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz)
+    if (col_bytes == 3) {
+        if (row_format == SPMV_ROWS_BASE16) LAUNCH_FORMAT(3, SPMV_ROWS_BASE16);
+        else LAUNCH_FORMAT(3, SPMV_ROWS_U32);
+    } else {
+        if (row_format == SPMV_ROWS_BASE16) LAUNCH_FORMAT(4, SPMV_ROWS_BASE16);
+        else LAUNCH_FORMAT(4, SPMV_ROWS_U32);
+    }
+#undef LAUNCH_FORMAT
+}
+
+static void spmv_run_common(void* e, spmv_data_t* spmv_data, bool trans,
+                            uint32_t col_bytes = 4, uint32_t row_format = SPMV_ROWS_U32) {
+    if ((col_bytes != 3 && col_bytes != 4) || row_format > SPMV_ROWS_BASE16) {
+        fprintf(stderr, "Invalid packed SpMV format\n");
+        exit(-1);
+    }
     SpmvEngine* eng = reinterpret_cast<SpmvEngine*>(e);
 
     const uint32_t* rowptr = reinterpret_cast<const uint32_t*>(spmv_data->row_entries);
@@ -420,7 +468,7 @@ static void spmv_run_common(void* e, spmv_data_t* spmv_data, bool trans) {
     if (num_rows <= 0) return;
 
     // Tune once (reads rowptr to host, negligible vs SpMV execution)
-    if (!eng->tuned) spmv_autotune(eng, rowptr, num_rows);
+    if (!eng->tuned) spmv_autotune(eng, rowptr, num_rows, row_format);
 
     int TPB = eng->threads_per_block;
     const int warps_per_block = max(1, TPB / WARP_SIZE);
@@ -442,23 +490,23 @@ static void spmv_run_common(void* e, spmv_data_t* spmv_data, bool trans) {
         switch (eng->warp_items) {
             case 256:
                 SPMV_NVTX_PUSH(trans ? "spmv_run_trans[wi=256]" : "spmv_run[wi=256]");
-                spmv_launch<256>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz);
+                spmv_launch<256>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz, col_bytes, row_format);
                 SPMV_NVTX_POP();
                 break;
             case 1024:
                 SPMV_NVTX_PUSH(trans ? "spmv_run_trans[wi=1024]" : "spmv_run[wi=1024]");
-                spmv_launch<1024>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz);
+                spmv_launch<1024>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz, col_bytes, row_format);
                 SPMV_NVTX_POP();
                 break;
             case 2048:
                 SPMV_NVTX_PUSH(trans ? "spmv_run_trans[wi=2048]" : "spmv_run[wi=2048]");
-                spmv_launch<2048>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz);
+                spmv_launch<2048>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz, col_bytes, row_format);
                 SPMV_NVTX_POP();
                 break;
             case 512:
             default:
                 SPMV_NVTX_PUSH(trans ? "spmv_run_trans[wi=512]" : "spmv_run[wi=512]");
-                spmv_launch<512>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz);
+                spmv_launch<512>(kernel, blocks, tpb, rowptr, colidx, x, y, num_rows, total_nnz, col_bytes, row_format);
                 SPMV_NVTX_POP();
                 break;
         }
@@ -479,4 +527,15 @@ SPMV_API void spmv_engine_run(void* e, spmv_data_t* spmv_data) {
 // vector_in is indexed by row, vector_out by column.
 SPMV_API void spmv_engine_run_trans(void* e, spmv_data_t* spmv_data) {
     spmv_run_common(e, spmv_data, true);
+}
+
+// Optional format-aware entry points. Legacy engines need not export these.
+SPMV_API void spmv_engine_run_packed(void* e, spmv_data_t* data,
+                                    uint32_t col_bytes, uint32_t row_format) {
+    spmv_run_common(e, data, false, col_bytes, row_format);
+}
+
+SPMV_API void spmv_engine_run_trans_packed(void* e, spmv_data_t* data,
+                                          uint32_t col_bytes, uint32_t row_format) {
+    spmv_run_common(e, data, true, col_bytes, row_format);
 }

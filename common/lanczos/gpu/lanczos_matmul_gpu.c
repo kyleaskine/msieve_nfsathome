@@ -13,6 +13,7 @@ $Id$
 --------------------------------------------------------------------*/
 
 #include "lanczos_gpu.h"
+#include <spmv_format.h>
 #if !defined(WIN32) && !defined(_WIN64)
 #include <unistd.h>
 #endif
@@ -25,6 +26,8 @@ extern void *spmv_engine_init(int *vbits);
 extern void spmv_engine_free(void *engine);
 extern void spmv_engine_run(void *engine, spmv_data_t *spmv_data);
 extern void spmv_engine_run_trans(void *engine, spmv_data_t *spmv_data);
+extern void spmv_engine_run_packed(void *, spmv_data_t *, uint32, uint32);
+extern void spmv_engine_run_trans_packed(void *, spmv_data_t *, uint32, uint32);
 extern void spmv_engine_set_kernel(void *engine, int kernel);
 #endif
 #include "lanczos_gpu_core.h"
@@ -352,13 +355,17 @@ static void radix_sort(entry_idx_t *arr, uint64 n) {
 }
 
 /*-------------------------------------------------------------------*/
-static size_t block_bytes(uint64 num_entries, uint32 num_rows) {
+static size_t col_region_bytes(uint64 num_entries, uint32 col_bytes) {
 
-	/* a packed block: column indices padded to 256 bytes, then
-	   the row pointers */
+	/* a packed block starts with its column indices, padded to
+	   256 bytes; the row pointers follow at this offset */
 
-	return ((((size_t)num_entries + 63) & ~(size_t)63) +
-			num_rows + 1) * sizeof(uint32);
+	return ((size_t)num_entries * col_bytes + 255) & ~(size_t)255;
+}
+
+static size_t block_bytes(uint64 num_entries, uint32 col_bytes, size_t row_bytes) {
+
+	return col_region_bytes(num_entries, col_bytes) + row_bytes;
 }
 
 /*-------------------------------------------------------------------*/
@@ -371,7 +378,6 @@ static void pack_matrix_block(block_row_t *b,
 
 	uint64 i, j;
 	uint32 num_rows = row_max - row_min;
-	uint32 *col_entries;
 	uint32 *row_entries;
 
 	/* the CSR arrays below, and everything downstream of them, index
@@ -392,8 +398,8 @@ static void pack_matrix_block(block_row_t *b,
 	   (WSL limits pinned memory), it stays in ordinary memory: its
 	   copies then run several times slower, but the solve goes on */
 
-	b->row_offset = ((size_t)num_entries + 63) & ~(size_t)63;
-	b->bytes = block_bytes(num_entries, num_rows);
+	b->row_offset = col_region_bytes(num_entries, b->col_bytes);
+	b->bytes = b->row_offset + b->row_bytes;
 	b->streamed = streamed;
 	if (streamed &&
 	    cuMemHostAlloc((void **)&b->host_data, b->bytes, 0) ==
@@ -409,11 +415,17 @@ static void pack_matrix_block(block_row_t *b,
 				"memory instead, which is slower\n");
 			warned = 1;
 		}
-		b->host_data = (uint32 *)xmalloc(b->bytes);
+		b->host_data = (uint8 *)xmalloc(b->bytes);
 	}
-	col_entries = b->host_data;
-	row_entries = b->host_data + b->row_offset;
-	memset(row_entries, 0, (num_rows + 1) * sizeof(uint32));
+	/* Columns are overwritten below. Only zero their padding and the raw
+	   row counts; the compressed row encoder writes its own padding. */
+	memset(b->host_data + (size_t)num_entries * b->col_bytes, 0,
+		b->row_offset - (size_t)num_entries * b->col_bytes);
+	row_entries = b->row_format == SPMV_ROWS_BASE16 ?
+		(uint32 *)xcalloc((size_t)num_rows + 1, sizeof(uint32)) :
+		(uint32 *)(b->host_data + b->row_offset);
+	if (b->row_format == SPMV_ROWS_U32)
+		memset(row_entries, 0, b->row_bytes);
 
 	if (is_trans) {
 		for (i = 0; i < num_entries; i++) {
@@ -433,7 +445,13 @@ static void pack_matrix_block(block_row_t *b,
 
 		entry_idx_t *e = entries + i;
 
-		col_entries[i] = e[0].col_off - col_min;
+		uint32 col = e[0].col_off - col_min;
+		if (b->col_bytes == 3) {
+			spmv_col24_put(b->host_data, (size_t)i, col);
+		}
+		else {
+			((uint32 *)b->host_data)[i] = col;
+		}
 
 		if (i > 0 && e[0].row_off != e[-1].row_off) {
 			row_entries[e[-1].row_off - row_min] = (uint32)j;
@@ -452,6 +470,14 @@ static void pack_matrix_block(block_row_t *b,
 		j += t;
 	}
 	row_entries[num_rows] = (uint32)num_entries;
+	if (b->row_format == SPMV_ROWS_BASE16) {
+		if (spmv_row16_bytes(row_entries, num_rows) != b->row_bytes) {
+			printf("error: compressed row pointers differ from the plan\n");
+			exit(-1);
+		}
+		spmv_pack_rows(b->host_data + b->row_offset, row_entries, num_rows);
+		free(row_entries);
+	}
 
 	b->num_rows = num_rows;
 	b->num_cols = col_max - col_min;
@@ -467,10 +493,10 @@ static void upload_block(gpudata_t *d, block_row_t *b) {
 	   with no nonzeros still gets a (tiny) column array, since CUDA
 	   refuses zero-byte allocations */
 
-	size_t col_bytes = b->num_col_entries * sizeof(uint32);
+	size_t col_bytes = b->row_offset;
 	size_t col_alloc = MAX(col_bytes, sizeof(uint32));
-	size_t row_bytes = (b->num_rows + 1) * sizeof(uint32);
-	uint32 *row_entries = b->host_data + b->row_offset;
+	size_t row_bytes = b->row_bytes;
+	uint8 *row_entries = b->host_data + b->row_offset;
 
 	if (d->use_cudamanaged) {
 		CUDA_TRY(cuMemAllocManaged(&b->col_entries,
@@ -513,13 +539,13 @@ static size_t vector_mem_bytes(packed_matrix_t *p) {
 
 	/* the vectors used in the lanczos iteration, and the vv kernel
 	   scratch array */
-
+	gpudata_t *d = (gpudata_t *)p->extra;
 #ifdef HAVE_MPI
-	return (6 * (size_t)p->nsubcols +
+	return ((6 - d->host_check) * (size_t)p->nsubcols +
 		2 * (size_t)MAX(p->nrows, p->ncols)) * sizeof(v_t) +
 		VBITS * sizeof(v_t);
 #else
-	return 7 * (size_t)p->max_ncols * sizeof(v_t) +
+	return (7 - d->host_check) * (size_t)p->max_ncols * sizeof(v_t) +
 			VBITS * sizeof(v_t);
 #endif
 }
@@ -586,6 +612,10 @@ typedef struct {
 	uint32 *size;
 	uint64 *nnz;
 	size_t *bytes;
+	size_t *row_bytes;
+	uint32 *row_format;
+	uint32 *col_bytes;
+	uint32 col24;
 
 	uint8 *streamed;        /* PLACE_STREAM only */
 	uint32 num_slots;
@@ -619,11 +649,21 @@ static void plan_add_block(block_plan_t *plan, uint32 start, uint32 size,
 					plan->alloc * sizeof(uint64));
 		plan->bytes = (size_t *)xrealloc(plan->bytes,
 					plan->alloc * sizeof(size_t));
+		plan->row_bytes = (size_t *)xrealloc(plan->row_bytes,
+					plan->alloc * sizeof(size_t));
+		plan->row_format = (uint32 *)xrealloc(plan->row_format,
+					plan->alloc * sizeof(uint32));
+		plan->col_bytes = (uint32 *)xrealloc(plan->col_bytes,
+					plan->alloc * sizeof(uint32));
 	}
 	plan->start[n] = start;
 	plan->size[n] = size;
 	plan->nnz[n] = nnz;
-	plan->bytes[n] = block_bytes(nnz, num_rows);
+	plan->row_bytes[n] = ((size_t)num_rows + 1) * sizeof(uint32);
+	plan->row_format[n] = SPMV_ROWS_U32;
+	plan->col_bytes[n] = spmv_col_bytes(plan->col24, size);
+	plan->bytes[n] = block_bytes(nnz, plan->col_bytes[n],
+				plan->row_bytes[n]);
 	plan->num_blocks++;
 }
 
@@ -633,6 +673,9 @@ static void plan_free(block_plan_t *plan) {
 	free(plan->size);
 	free(plan->nnz);
 	free(plan->bytes);
+	free(plan->row_bytes);
+	free(plan->row_format);
+	free(plan->col_bytes);
 	free(plan->streamed);
 	memset(plan, 0, sizeof(block_plan_t));
 }
@@ -765,6 +808,70 @@ static void plan_trans_blocks(packed_matrix_t *p, block_plan_t *plan) {
 }
 
 /*-------------------------------------------------------------------*/
+static uint32 row_lower_bound(la_col_t *col, uint32 row) {
+	uint32 lo = 0, hi = col->weight;
+	while (lo < hi) {
+		uint32 mid = lo + (hi - lo) / 2;
+		if (col->data[mid] < row) lo = mid + 1;
+		else hi = mid;
+	}
+	return lo;
+}
+
+static void plan_compressed_rows(packed_matrix_t *p, block_plan_t *plan,
+			uint32 num_threads) {
+	/* Determine exact compressed sizes before choosing residency. Only a
+	   single row-pointer array is needed, even for very large matrices. */
+	uint32 k;
+	uint32 *ptr = (uint32 *)xmalloc(((size_t)MAX(p->nrows, p->ncols) + 1) * sizeof(uint32));
+	(void)num_threads; /* also build without OpenMP */
+	for (k = 0; k < plan->num_blocks; k++) {
+		uint32 i, j, rows;
+		if (k < plan->num_forward) {
+			rows = p->nrows;
+			memset(ptr, 0, ((size_t)rows + 1) * sizeof(uint32));
+			for (i = plan->start[k]; i < plan->start[k] + plan->size[k]; i++) {
+				la_col_t *col = p->unpacked_cols + i;
+				for (j = 0; j < col->weight && col->data[j] < rows; j++)
+					ptr[col->data[j] + 1]++;
+			}
+			for (i = 0; i < rows; i++) ptr[i + 1] += ptr[i];
+		}
+		else {
+			rows = p->ncols;
+			ptr[0] = 0;
+			/* Column counts are independent. Parallelize the binary searches
+			   without allocating one full row array per worker. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(num_threads) if(num_threads > 1)
+#endif
+			for (i = 0; i < rows; i++) {
+				la_col_t *col = p->unpacked_cols + i;
+				ptr[i + 1] =
+					row_lower_bound(col, plan->start[k] + plan->size[k]) -
+					row_lower_bound(col, plan->start[k]);
+			}
+			for (i = 0; i < rows; i++) ptr[i + 1] += ptr[i];
+		}
+		if (ptr[rows] != plan->nnz[k]) {
+			printf("error: compressed-row planning count mismatch\n");
+			exit(-1);
+		}
+		{
+			size_t bytes = spmv_row16_bytes(ptr, rows);
+			/* Descriptor offsets are uint32. A raw fallback also avoids
+			   expanding unusually dense or tiny pointer arrays. */
+			if (bytes < plan->row_bytes[k] && bytes <= UINT32_MAX) {
+				plan->row_bytes[k] = bytes;
+				plan->row_format[k] = SPMV_ROWS_BASE16;
+				plan->bytes[k] = block_bytes(plan->nnz[k],
+					plan->col_bytes[k], bytes);
+			}
+		}
+	}
+	free(ptr);
+}
+
 static uint32 spaced_block(uint32 i, uint32 m, uint32 n) {
 
 	/* the i-th of m blocks spread evenly over n */
@@ -866,6 +973,7 @@ static void plan_matrix(msieve_obj *obj, packed_matrix_t *p,
 	memset(plan, 0, sizeof(block_plan_t));
 	plan->mode = PLACE_RESIDENT;
 	plan->max_slots = NUM_STREAM_SLOTS;
+	plan->col24 = d->col24;
 
 	/* every block's extent and size, forward and (two-copy)
 	   transpose; gpu_matrix_init builds exactly these */
@@ -873,6 +981,22 @@ static void plan_matrix(msieve_obj *obj, packed_matrix_t *p,
 	plan_forward_blocks(p, plan);
 	if (!d->single_copy)
 		plan_trans_blocks(p, plan);
+	if (d->row16)
+		plan_compressed_rows(p, plan, MAX(1, obj->num_threads));
+	if (d->col24 || d->row16) {
+		size_t saved = 0;
+		uint32 columns = 0, rows = 0;
+		for (i = 0; i < plan->num_blocks; i++) {
+			uint32 nrows = i < plan->num_forward ? p->nrows : p->ncols;
+			saved += block_bytes(plan->nnz[i], 4, ((size_t)nrows + 1) * 4) - plan->bytes[i];
+			columns += plan->col_bytes[i] == 3;
+			rows += plan->row_format[i] == SPMV_ROWS_BASE16;
+		}
+		logprintf(obj, "packed CSR: %u/%u blocks with 24-bit columns, "
+			"%u/%u with compressed rows; %.1f MiB saved across all blocks\n",
+			columns, plan->num_blocks, rows, plan->num_blocks,
+			(double)saved / 1048576);
+	}
 
 	if (d->use_cudamanaged) {
 		if (obj->nfs_args != NULL &&
@@ -1032,6 +1156,9 @@ static void gpu_matrix_init(packed_matrix_t *p, block_plan_t *plan) {
 
 		b->blocksize = blocksize;
 		b->start = plan->start[i];
+		b->col_bytes = plan->col_bytes[i];
+		b->row_format = plan->row_format[i];
+		b->row_bytes = plan->row_bytes[i];
 		pack_matrix_block(b, entries, num_entries,
 				0, p->nrows,
 				b->start, b->start + blocksize,
@@ -1062,6 +1189,9 @@ static void gpu_matrix_init(packed_matrix_t *p, block_plan_t *plan) {
 
 		b->blocksize = plan->size[k];
 		b->start = plan->start[k];
+		b->col_bytes = plan->col_bytes[k];
+		b->row_format = plan->row_format[k];
+		b->row_bytes = plan->row_bytes[k];
 		pack_matrix_block(b, entries, num_entries,
 				0, p->ncols,
 				b->start, b->start + b->blocksize,
@@ -1229,9 +1359,41 @@ static stream_slot_t * stream_load(gpudata_t *d, block_row_t *b,
 	CUDA_TRY(cuStreamWaitEvent(d->copy_stream, s->freed, 0))
 	CUDA_TRY(cuMemcpyHtoDAsync(s->buf, b->host_data, b->bytes,
 				d->copy_stream))
+	d->copy_bytes += b->bytes;
+	d->copy_calls++;
 	CUDA_TRY(cuEventRecord(s->ready, d->copy_stream))
 	s->blk = b;
 	return s;
+}
+
+/* Count complete A*x / A^T*x pairs in the GPU layer, including cache reuse.
+   Standalone multiplies used to verify dependencies are not iterations. */
+static void matrix_pair_begin(gpudata_t *d) {
+	d->iteration_bytes = d->copy_bytes;
+	d->iteration_calls = d->copy_calls;
+	d->iteration_pending = 1;
+}
+
+static void matrix_pair_end(gpudata_t *d) {
+	if (!d->iteration_pending) return;
+	d->iteration_pending = 0;
+	/* Exclude three initial pairs to let the streaming cache settle.
+	   A fresh solve includes its initialization product in those three. */
+	if (++d->iteration_products <= 3) return;
+	d->measured_bytes += d->copy_bytes - d->iteration_bytes;
+	d->measured_calls += d->copy_calls - d->iteration_calls;
+	d->measured_iterations++;
+}
+
+static void matrix_transfer_summary(gpudata_t *d) {
+	/* One final aggregate also covers short bench windows. Resident and
+	   managed-memory solves have no explicit streaming transfers to report. */
+	if (!d->num_slots || !d->measured_iterations) return;
+	logprintf(d->obj, "matrix transfers: %.3f MiB/iteration, "
+		"%.2f copies/iteration (%" PRIu64 " measured iterations)\n",
+		(double)d->measured_bytes / d->measured_iterations / 1048576,
+		(double)d->measured_calls / d->measured_iterations,
+		d->measured_iterations);
 }
 
 /*------------------------------------------------------------------------*/
@@ -1253,6 +1415,8 @@ load_spmv_engine(msieve_obj *obj, gpudata_t *d)
 	d->spmv_engine_free = spmv_engine_free;
 	d->spmv_engine_run = spmv_engine_run;
 	d->spmv_engine_run_trans = spmv_engine_run_trans;
+	d->spmv_engine_run_packed = spmv_engine_run_packed;
+	d->spmv_engine_run_trans_packed = spmv_engine_run_trans_packed;
 	d->spmv_engine_set_kernel = spmv_engine_set_kernel;
 
 	/* Preserve the historical spmvlib= override for testing/custom engines. */
@@ -1288,6 +1452,10 @@ load_spmv_engine(msieve_obj *obj, gpudata_t *d)
 	   the optional entry points come from it too (NULL if it has none) */
 	d->spmv_engine_run_trans = get_lib_symbol(d->spmv_engine_handle,
 					"spmv_engine_run_trans");
+	d->spmv_engine_run_packed = get_lib_symbol(d->spmv_engine_handle,
+					"spmv_engine_run_packed");
+	d->spmv_engine_run_trans_packed = get_lib_symbol(d->spmv_engine_handle,
+					"spmv_engine_run_trans_packed");
 	d->spmv_engine_set_kernel = get_lib_symbol(d->spmv_engine_handle,
 					"spmv_engine_set_kernel");
 	if (d->spmv_engine_init == NULL ||
@@ -1353,6 +1521,10 @@ load_spmv_engine(msieve_obj *obj, gpudata_t *d)
 	d->spmv_engine_run_trans = get_lib_symbol(
 					d->spmv_engine_handle,
 					"spmv_engine_run_trans");
+	d->spmv_engine_run_packed = get_lib_symbol(d->spmv_engine_handle,
+					"spmv_engine_run_packed");
+	d->spmv_engine_run_trans_packed = get_lib_symbol(d->spmv_engine_handle,
+					"spmv_engine_run_trans_packed");
 	d->spmv_engine_set_kernel = get_lib_symbol(
 					d->spmv_engine_handle,
 					"spmv_engine_set_kernel");
@@ -1393,6 +1565,7 @@ void matrix_extra_init(msieve_obj *obj, packed_matrix_t *p,
 	}
 
 	p->extra = d = (gpudata_t *)xcalloc(1, sizeof(gpudata_t));
+	d->obj = obj;
 
 	d->gpu_info = gpu_info = (gpu_info_t *)xmalloc(sizeof(gpu_info_t));
 	memcpy(gpu_info, gpu_config.info + obj->which_gpu,
@@ -1472,6 +1645,10 @@ void matrix_extra_init(msieve_obj *obj, packed_matrix_t *p,
 	/* should we store only one copy of the matrix on the card */
 
 	d->single_copy = 0;
+	d->host_check = obj->nfs_args != NULL &&
+		strstr(obj->nfs_args, "host_check=1") != NULL;
+	if (d->host_check)
+		logprintf(obj, "keeping the Lanczos check vector in host memory\n");
 	if (obj->nfs_args != NULL &&
 	    strstr(obj->nfs_args, "single_copy=1") != NULL) {
 		if (d->spmv_engine_run_trans == NULL) {
@@ -1482,6 +1659,15 @@ void matrix_extra_init(msieve_obj *obj, packed_matrix_t *p,
 		d->single_copy = 1;
 		logprintf(obj, "storing a single copy of the matrix "
 				"(no transpose) on the GPU\n");
+	}
+	d->col24 = obj->nfs_args != NULL && strstr(obj->nfs_args, "col24=1") != NULL;
+	d->row16 = obj->nfs_args != NULL && strstr(obj->nfs_args, "row16=1") != NULL;
+	if ((d->col24 || d->row16) &&
+	    (d->spmv_engine_run_packed == NULL ||
+	     (d->single_copy && d->spmv_engine_run_trans_packed == NULL))) {
+		printf("error: SpMV engine does not support packed CSR; rebuild it "
+			"or omit col24=1 and row16=1\n");
+		exit(-1);
 	}
 
 	/* Set preferred nonzeros per matrix block. The default sizes the
@@ -1643,6 +1829,7 @@ void matrix_extra_free(packed_matrix_t *p) {
 
 	gpudata_t *d = (gpudata_t *)p->extra;
 
+	matrix_transfer_summary(d);
 	gpu_matrix_free(p);
 
 	CUDA_TRY(cuMemFree(d->gpu_scratch))
@@ -1663,7 +1850,7 @@ void matrix_extra_free(packed_matrix_t *p) {
 /*-------------------------------------------------------------------*/
 static void run_spmv_block(gpudata_t *d, block_row_t *blk,
 			CUdeviceptr vector_in, CUdeviceptr vector_out,
-			spmv_engine_run_func run, uint32 pass,
+			uint32 scatter, uint32 pass,
 			const char *label) {
 
 	spmv_data_t spmv_data;
@@ -1684,14 +1871,14 @@ static void run_spmv_block(gpudata_t *d, block_row_t *blk,
 		CUDA_TRY(cuStreamWaitEvent(NULL, slot->ready, 0))
 		spmv_data.col_entries = slot->buf;
 		spmv_data.row_entries = slot->buf +
-				blk->row_offset * sizeof(uint32);
+				blk->row_offset;
 	}
 	else if (d->use_cudamanaged == 2) {
 		CUDA_TRY(my_cuMemPrefetchAsync(blk->col_entries,
-			blk->num_col_entries * sizeof(uint32),
+			MAX(blk->row_offset, sizeof(uint32)),
 			d->gpu_info->device_handle, 0))
 		CUDA_TRY(my_cuMemPrefetchAsync(blk->row_entries,
-			(blk->num_rows + 1) * sizeof(uint32),
+			blk->row_bytes,
 			d->gpu_info->device_handle, 0))
 	}
 	spmv_data.num_rows = blk->num_rows;
@@ -1700,7 +1887,16 @@ static void run_spmv_block(gpudata_t *d, block_row_t *blk,
 	spmv_data.vector_out = vector_out;
 
 	LANCZOS_NVTX_PUSH(label, LANCZOS_NVTX_COLOR_SPMV_RUN);
-	run(d->spmv_engine, &spmv_data);
+	if (blk->col_bytes != 4 || blk->row_format != SPMV_ROWS_U32) {
+		spmv_engine_run_packed_func run = scatter ?
+			d->spmv_engine_run_trans_packed : d->spmv_engine_run_packed;
+		run(d->spmv_engine, &spmv_data, blk->col_bytes, blk->row_format);
+	}
+	else {
+		spmv_engine_run_func run = scatter ?
+			d->spmv_engine_run_trans : d->spmv_engine_run;
+		run(d->spmv_engine, &spmv_data);
+	}
 	LANCZOS_NVTX_POP();
 	(void)label;
 
@@ -1738,7 +1934,7 @@ static void mul_packed_gpu(packed_matrix_t *p,
 
 		run_spmv_block(d, blk,
 			(CUdeviceptr)((v_t *)x->gpu_vec + blk->start),
-			b->gpu_vec, d->spmv_engine_run, 0,
+			b->gpu_vec, 0, 0,
 			"spmv_engine_run.normal");
 	}
 	LANCZOS_NVTX_POP();
@@ -1788,7 +1984,7 @@ static void mul_packed_trans_gpu(packed_matrix_t *p,
 
 			run_spmv_block(d, blk, x->gpu_vec,
 				(CUdeviceptr)((v_t *)b->gpu_vec + blk->start),
-				d->spmv_engine_run_trans, 1,
+				1, 1,
 				"spmv_engine_run.trans_scatter");
 		}
 	}
@@ -1801,7 +1997,7 @@ static void mul_packed_trans_gpu(packed_matrix_t *p,
 
 			run_spmv_block(d, blk,
 				(CUdeviceptr)((v_t *)x->gpu_vec + blk->start),
-				b->gpu_vec, d->spmv_engine_run, 0,
+				b->gpu_vec, 0, 0,
 				"spmv_engine_run.trans");
 		}
 	}
@@ -1832,6 +2028,7 @@ void mul_core(packed_matrix_t *A, void *x_in, void *b_in) {
 	gpuvec_t *x = (gpuvec_t *)x_in;
 	gpuvec_t *b = (gpuvec_t *)b_in;
 
+	matrix_pair_begin((gpudata_t *)A->extra);
 	LANCZOS_NVTX_PUSH("mul_core", LANCZOS_NVTX_COLOR_MUL);
 	mul_packed_gpu(A, x, b);
 	LANCZOS_NVTX_POP();
@@ -1873,6 +2070,7 @@ void mul_trans_core(packed_matrix_t *A, void *x_in, void *b_in) {
 	LANCZOS_NVTX_PUSH("mul_trans_core", LANCZOS_NVTX_COLOR_MUL_TRANS);
 	mul_packed_trans_gpu(A, x, b);
 	LANCZOS_NVTX_POP();
+	matrix_pair_end((gpudata_t *)A->extra);
 
 #ifdef LANCZOS_GPU_DEBUG
 	{
@@ -1932,13 +2130,13 @@ size_t packed_matrix_sizeof(packed_matrix_t *p) {
 	for (i = 0; i < d->num_block_rows; i++) {
 		block_row_t *b = d->block_rows + i;
 		if (!b->streamed)
-			mem_use += (b->num_rows + 1 + b->num_col_entries) * sizeof(uint32);
+			mem_use += b->bytes;
 	}
 
 	for (i = 0; i < d->num_trans_block_rows; i++) {
 		block_row_t *b = d->trans_block_rows + i;
 		if (!b->streamed)
-			mem_use += (b->num_rows + 1 + b->num_col_entries) * sizeof(uint32);
+			mem_use += b->bytes;
 	}
 	mem_use += d->staging_bytes;
 

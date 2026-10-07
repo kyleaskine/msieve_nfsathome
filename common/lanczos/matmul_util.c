@@ -503,17 +503,11 @@ void global_allgather(void *send_buf_in, void *recv_buf_in,
 }
 
 /*-----------------------------------------------------------------------*/
-v_t * gather_ncols(msieve_obj *obj,
-			packed_matrix_t *packed_matrix,
-			void *v_in, void *scratch_in, 
-			v_t *out) {
-
-#ifdef HAVE_CUDA 
-	v_t *v = (v_t *)((gpuvec_t *)v_in)->host_vec;
-	v_t *scratch = (v_t *)((gpuvec_t *)scratch_in)->host_vec;
-	vv_copyout(v, v_in, packed_matrix->nsubcols); 
+v_t *gather_ncols_host(msieve_obj *obj, packed_matrix_t *packed_matrix,
+			v_t *v, void *scratch_in, v_t *out) {
+#ifdef HAVE_CUDA
+	v_t *scratch = ((gpuvec_t *)scratch_in)->host_vec;
 #else
-	v_t *v = (v_t *)v_in;
 	v_t *scratch = (v_t *)scratch_in;
 #endif
 
@@ -546,6 +540,17 @@ v_t * gather_ncols(msieve_obj *obj,
 	}
 	
 	return out;
+}
+
+v_t *gather_ncols(msieve_obj *obj, packed_matrix_t *packed_matrix,
+			void *v_in, void *scratch_in, v_t *out) {
+#ifdef HAVE_CUDA
+	v_t *v = ((gpuvec_t *)v_in)->host_vec;
+	vv_copyout(v, v_in, packed_matrix->nsubcols);
+#else
+	v_t *v = (v_t *)v_in;
+#endif
+	return gather_ncols_host(obj, packed_matrix, v, scratch_in, out);
 }
 
 /*-----------------------------------------------------------------------*/
@@ -582,18 +587,11 @@ v_t * gather_nrows(msieve_obj *obj,
 }
 
 /*-----------------------------------------------------------------------*/
-void scatter_ncols(msieve_obj *obj,
-			packed_matrix_t *packed_matrix,
-			void *out_in, void *scratch_in, 
-			v_t *in) {
-
-	/* push out to the top MPI row */
-
-#ifdef HAVE_CUDA 
-	v_t *out = (v_t *)((gpuvec_t *)out_in)->host_vec;
-	v_t *scratch = (v_t *)((gpuvec_t *)scratch_in)->host_vec;
+void scatter_ncols_host(msieve_obj *obj, packed_matrix_t *packed_matrix,
+			v_t *out, void *scratch_in, v_t *in) {
+#ifdef HAVE_CUDA
+	v_t *scratch = ((gpuvec_t *)scratch_in)->host_vec;
 #else
-	v_t *out = (v_t *)out_in;
 	v_t *scratch = (v_t *)scratch_in;
 #endif
 
@@ -613,8 +611,18 @@ void scatter_ncols(msieve_obj *obj,
 				packed_matrix->nsubcols,
 	   			obj->mpi_word, 0, 
        				obj->mpi_la_col_grid))
+}
+
+void scatter_ncols(msieve_obj *obj, packed_matrix_t *packed_matrix,
+			void *out_in, void *scratch_in, v_t *in) {
 #ifdef HAVE_CUDA
-	vv_copyin(out_in, out, packed_matrix->nsubcols); 
+	v_t *out = ((gpuvec_t *)out_in)->host_vec;
+#else
+	v_t *out = (v_t *)out_in;
+#endif
+	scatter_ncols_host(obj, packed_matrix, out, scratch_in, in);
+#ifdef HAVE_CUDA
+	vv_copyin(out_in, out, packed_matrix->nsubcols);
 #endif
 }
 

@@ -573,9 +573,57 @@ static uint32 combine_cols(uint32 ncols,
 }
 
 /*-----------------------------------------------------------------------*/
+/* v0 is either an ordinary vector or a plain host checkpoint/check buffer.
+   Keeping it separate prevents passing a host allocation to GPU operations. */
+typedef struct {
+	void *vector;
+	v_t *host;
+} check_vector_t;
+
+#ifndef HAVE_MPI
+/* MPI checkpoints go through gather_ncols_host/scatter_ncols_host instead */
+static void check_copyin(check_vector_t *v, v_t *src, uint32 n) {
+	if (v->host) memcpy(v->host, src, n * sizeof(v_t));
+	else vv_copyin(v->vector, src, n);
+}
+
+static void check_copyout(v_t *out, check_vector_t *v, uint32 n) {
+	if (v->host) memcpy(out, v->host, n * sizeof(v_t));
+	else vv_copyout(out, v->vector, n);
+}
+#endif
+
+static void check_capture(check_vector_t *v, void *src, uint32 n) {
+	if (v->host) vv_copyout(v->host, src, n);
+	else vv_copy(v->vector, src, n);
+}
+
+static void check_clear(check_vector_t *v, uint32 n) {
+	if (v->host) memset(v->host, 0, n * sizeof(v_t));
+	else vv_clear(v->vector, n);
+}
+
+#ifdef HAVE_CUDA
+/* Only call after SpMV, when scratch is no longer live. The other operand
+   must not be scratch: uploading here would overwrite it before the product. */
+static void *check_upload(check_vector_t *v, void *scratch,
+			void *other, uint32 n) {
+	if (!v->host) return v->vector;
+	if (scratch == other) {
+		printf("error: check vector scratch aliases inner-product operand\n");
+		exit(-1);
+	}
+	vv_upload_check(scratch, v->host, n);
+	return scratch;
+}
+#else
+/* only CUDA builds keep the check vector in host memory (host_check=1) */
+#define check_upload(v, scratch, other, n) ((v)->vector)
+#endif
+
 static void dump_lanczos_state(msieve_obj *obj, 
 			packed_matrix_t *packed_matrix,
-			void *x, v_t **vt_v0, void **v, void *v0,
+			void *x, v_t **vt_v0, void **v, check_vector_t *v0,
 			v_t **vt_a_v, v_t **vt_a2_v, v_t **winv,
 			uint32 max_n, uint32 dim_solved, uint32 iter,
 			uint32 s[2][VBITS], uint32 dim1, void *scratch) {
@@ -638,7 +686,9 @@ static void dump_lanczos_state(msieve_obj *obj,
 	status &= (fwrite(tmp, sizeof(v_t), (size_t)max_n, fp) == max_n);
 	MPI_NODE_0_END
 
-	tmp = gather_ncols(obj, packed_matrix, v0, scratch, tmp);
+	tmp = v0->host ?
+		gather_ncols_host(obj, packed_matrix, v0->host, scratch, tmp) :
+		gather_ncols(obj, packed_matrix, v0->vector, scratch, tmp);
 	MPI_NODE_0_START
 	status &= (fwrite(tmp, sizeof(v_t), (size_t)max_n, fp) == max_n);
 	MPI_NODE_0_END
@@ -655,7 +705,7 @@ static void dump_lanczos_state(msieve_obj *obj,
 	vv_copyout(tmp, v[2], max_n);
 	status &= (fwrite(tmp, sizeof(v_t), (size_t)max_n, fp) == max_n);
 
-	vv_copyout(tmp, v0, max_n);
+	check_copyout(tmp, v0, max_n);
 	status &= (fwrite(tmp, sizeof(v_t), (size_t)max_n, fp) == max_n);
 #endif
 
@@ -686,7 +736,7 @@ static void dump_lanczos_state(msieve_obj *obj,
 /*-----------------------------------------------------------------------*/
 static void read_lanczos_state(msieve_obj *obj, 
 			packed_matrix_t *packed_matrix,
-			void *x, v_t **vt_v0, void **v, void *v0,
+			void *x, v_t **vt_v0, void **v, check_vector_t *v0,
 			v_t **vt_a_v, v_t **vt_a2_v, v_t **winv,
 			uint32 max_n, uint32 *dim_solved, 
 			uint32 *iter, uint32 s[2][VBITS], uint32 *dim1,
@@ -755,7 +805,10 @@ static void read_lanczos_state(msieve_obj *obj,
 	MPI_NODE_0_START
 	status &= (fread(tmp, sizeof(v_t), (size_t)max_n, fp) == max_n);
 	MPI_NODE_0_END
-	scatter_ncols(obj, packed_matrix, v0, scratch, tmp);
+	if (v0->host)
+		scatter_ncols_host(obj, packed_matrix, v0->host, scratch, tmp);
+	else
+		scatter_ncols(obj, packed_matrix, v0->vector, scratch, tmp);
 #else
 	tmp = (v_t *)xmalloc(max_n * sizeof(v_t));
 
@@ -772,7 +825,7 @@ static void read_lanczos_state(msieve_obj *obj,
 	vv_copyin(v[2], tmp, max_n);
 
 	status &= (fread(tmp, sizeof(v_t), (size_t)max_n, fp) == max_n);
-	vv_copyin(v0, tmp, max_n);
+	check_copyin(v0, tmp, max_n);
 #endif
 	free(tmp);
 
@@ -786,7 +839,7 @@ static void read_lanczos_state(msieve_obj *obj,
 /*-----------------------------------------------------------------------*/
 static void init_lanczos_state(msieve_obj *obj, 
 			packed_matrix_t *packed_matrix, void *scratch, void *scratch2,
-			void *x, void *v0, v_t **vt_v0, void **v, 
+			void *x, check_vector_t *v0, v_t **vt_v0, void **v,
 			v_t **vt_a_v, v_t **vt_a2_v, v_t **winv,
 			uint32 n, uint32 s[2][VBITS], uint32 *dim1) {
 
@@ -809,7 +862,7 @@ static void init_lanczos_state(msieve_obj *obj,
 	free(tmp);
 
 	mul_sym_NxN_NxB(packed_matrix, x, v[0], scratch, scratch2);
-	vv_copy(v0, v[0], n);
+	check_capture(v0, v[0], n);
 
 	/* Subscripts larger than zero represent past versions of 
 	   these quantities, which start off empty (except for the 
@@ -844,7 +897,9 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 
 	uint32 n = packed_matrix->ncols;
 	uint32 max_n = packed_matrix->max_ncols;
-	void *vnext, *v[3], *x, *v0, *scratch, *tmp;
+	void *vnext, *v[3], *x, *scratch, *tmp;
+	check_vector_t check_storage = {0};
+	check_vector_t *v0 = &check_storage;
 	void *scratch2 = NULL;
 	v_t *out0, *out1, *out2, *out3;
 	v_t *winv[3], *vt_v0_next;
@@ -864,6 +919,8 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 	uint32 log_eta_once = 0;
 	uint32 next_check = 0;
 	uint32 next_dump = 0;
+	uint32 check_iter = 0;	/* iteration whose vnext v0 holds */
+	uint32 stop;
 	time_t first_time;
 
 	if (packed_matrix->num_threads > 1)
@@ -896,7 +953,10 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 	v[2] = vv_alloc(n, packed_matrix->extra);
 	vnext = vv_alloc(n, packed_matrix->extra);
 	x = vv_alloc(n, packed_matrix->extra);
-	v0 = vv_alloc(n, packed_matrix->extra);
+#ifdef HAVE_CUDA
+	v0->host = vv_alloc_check_host(n, packed_matrix->extra);
+#endif
+	if (!v0->host) v0->vector = vv_alloc(n, packed_matrix->extra);
     
 	/* VBITSxVBITS data */
 
@@ -928,6 +988,10 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 				&dim_solved, &iter, s, &dim1, scratch);
 		logprintf(obj, "restarting at iteration %u (dim = %u)\n",
 				iter, dim_solved);
+
+		/* checkpoints are written right after a check, so the
+		   saved check vector is that iteration's vnext */
+		check_iter = iter;
 	}
 	else {
 		init_lanczos_state(obj, packed_matrix, scratch, scratch2, x, 
@@ -1049,12 +1113,13 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 		   and is stored in vt_v0_next. */
 
 		if (iter < 4) {
-			vv_mul_BxN_NxB(packed_matrix, v[0], v0, vt_v0[0], n);
+			vv_mul_BxN_NxB(packed_matrix, v[0],
+				check_upload(v0, scratch, v[0], n), vt_v0[0], n);
 		}
 		else if (iter == 4) {
 			/* v0 is not needed from now on; recycle it 
 			   for use as a check vector */
-			vv_clear(v0, n);
+			check_clear(v0, n);
 		}
 
 		/* perform an integrity check on the iteration. This 
@@ -1062,16 +1127,32 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 		   to the vnext that was computed about check_interval 
 		   dimensions ago
 		
-		   Checks happen on a fixed schedule, as well as 
-		   right before a checkpoint file is written */
+		   Checks happen on a fixed schedule, as well as
+		   right before a checkpoint file is written.
+
+		   An interrupt forces a check and a checkpoint. The check
+		   is only valid against a check vector more than three
+		   iterations old (see the dump interval below), and before
+		   iteration 4 v0 is still the starting vector, so an
+		   interrupt that comes sooner than that waits a few
+		   iterations instead of failing the check. MPI does not
+		   checkpoint on an interrupt, so it stops at once */
+
+#ifdef HAVE_MPI
+		stop = obj->flags & MSIEVE_FLAG_STOP_SIEVING;
+#else
+		stop = (obj->flags & MSIEVE_FLAG_STOP_SIEVING) &&
+			iter >= 4 && iter - check_iter > 3;
+#endif
 
 		if (check_interval && (dim_solved >= next_check ||
 #ifndef HAVE_MPI
-		    obj->flags & MSIEVE_FLAG_STOP_SIEVING ||
+		    stop ||
 #endif
 		    dim_solved >= next_dump)) {
 
-			vv_mul_BxN_NxB(packed_matrix, v0, vnext, d, n);
+			vv_mul_BxN_NxB(packed_matrix,
+				check_upload(v0, scratch, vnext, n), vnext, d, n);
 			for (i = 0; i < VBITS; i++) {
 				if (!v_is_all_zeros(d[i])) {
 					logprintf(obj, "error: corrupt state, "
@@ -1089,9 +1170,10 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 				}
 			}
 			/* check passed */
-			next_check = ((dim_solved + 6 * VBITS) / 
+			next_check = ((dim_solved + 6 * VBITS) /
 					check_interval + 1) * check_interval;
-			vv_copy(v0, vnext, n);
+			check_capture(v0, vnext, n);
+			check_iter = iter;
 		}
 
 		/* compute d, fold it into vnext and update v'*v0 */
@@ -1288,7 +1370,7 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 
 			if (
 #ifndef HAVE_MPI
-			    obj->flags & MSIEVE_FLAG_STOP_SIEVING ||
+			    stop ||
 #endif
 			    dim_solved >= next_dump) {
 
@@ -1297,10 +1379,10 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 						   vt_a_v, vt_a2_v, winv, 
 						   max_n, dim_solved, 
 						   iter, s, dim1, scratch);
-				next_dump = ((dim_solved + 6 * VBITS) / dump_interval + 1) * 
+				next_dump = ((dim_solved + 6 * VBITS) / dump_interval + 1) *
 							dump_interval;
 			}
-			if (obj->flags & MSIEVE_FLAG_STOP_SIEVING)
+			if (stop)
 				break;
 		}
 
@@ -1317,7 +1399,10 @@ static v_t * block_lanczos_core(msieve_obj *obj,
 	/* free unneeded storage */
 
 	vv_free(vnext);
-	vv_free(v0);
+#ifdef HAVE_CUDA
+	if (v0->host) vv_free_check_host(v0->host);
+#endif
+	if (v0->vector) vv_free(v0->vector);
 
 	aligned_free(vt_a_v[0]);
 	aligned_free(vt_a_v[1]);

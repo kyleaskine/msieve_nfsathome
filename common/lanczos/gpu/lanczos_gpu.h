@@ -29,15 +29,18 @@ typedef struct {
 	uint32 num_col_entries;
 	uint32 blocksize;
 	uint32 start;                   /* first col (row for the transpose) */
-	CUdeviceptr col_entries;        /* uint32 */
-	CUdeviceptr row_entries;        /* uint32 */
+	CUdeviceptr col_entries;        /* uint32 or packed 24-bit indices */
+	CUdeviceptr row_entries;        /* raw or grouped relative pointers */
 
 	/* column indices followed by row pointers (at row_offset), in
-	   host memory while the matrix is set up; for streamed blocks
-	   it stays there, pinned */
-	uint32 *host_data;
+	   host memory (row_offset is in bytes) while the matrix is set up;
+	   for streamed blocks it stays there, pinned */
+	uint8 *host_data;
 	size_t row_offset;
+	size_t row_bytes;
 	size_t bytes;
+	uint32 col_bytes;               /* bytes per local column index */
+	uint32 row_format;
 
 	/* nonzero if the block lives in host memory and is copied to
 	   the card for every product. sched_idx holds its positions in
@@ -89,6 +92,8 @@ typedef struct {
 	spmv_engine_free_func spmv_engine_free;
 	spmv_engine_run_func spmv_engine_run;
 	spmv_engine_run_func spmv_engine_run_trans;
+	spmv_engine_run_packed_func spmv_engine_run_packed;
+	spmv_engine_run_packed_func spmv_engine_run_trans_packed;
 	spmv_engine_set_kernel_func spmv_engine_set_kernel;
 	void * spmv_engine;
 
@@ -97,6 +102,9 @@ typedef struct {
 
 	/* store only A on the card; A^T * x scatters through A's blocks */
 	uint32 single_copy;
+	uint32 host_check;
+	uint32 col24;
+	uint32 row16;
 
 	/* matrix blocks that don't fit on the card are streamed from
 	   pinned host memory. sched lists them in the order one Lanczos
@@ -108,6 +116,12 @@ typedef struct {
 	block_row_t **sched;
 	size_t streamed_bytes;
 	size_t staging_bytes;
+	uint64 copy_bytes, copy_calls;
+	uint64 iteration_bytes, iteration_calls;
+	uint64 measured_bytes, measured_calls, measured_iterations;
+	uint32 iteration_products;
+	uint32 iteration_pending;
+	msieve_obj *obj; /* borrowed for the final transfer summary */
 
 } gpudata_t;
 

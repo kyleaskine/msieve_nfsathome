@@ -231,6 +231,12 @@ v_t * gather_ncols(msieve_obj *obj,
 			void *v_in, void *scratch_in, 
 			v_t *out);
 			
+/* Checkpoint operations on a plain host vector, using the same MPI layout. */
+v_t *gather_ncols_host(msieve_obj *obj, packed_matrix_t *p,
+			v_t *v, void *scratch, v_t *out);
+void scatter_ncols_host(msieve_obj *obj, packed_matrix_t *p,
+			v_t *out, void *scratch, v_t *in);
+
 v_t * gather_nrows(msieve_obj *obj,
 			packed_matrix_t *packed_matrix,
 			void *scratch_in, v_t *out);
@@ -244,6 +250,11 @@ void scatter_ncols(msieve_obj *obj,
 /* top-level calls for vector-vector operations */
 
 void *vv_alloc(uint32 n, void *extra);
+#ifdef HAVE_CUDA
+v_t *vv_alloc_check_host(uint32 n, void *extra);
+void vv_free_check_host(v_t *host);
+void vv_upload_check(void *scratch, const v_t *host, uint32 n);
+#endif
 void vv_free(void *v);
 void vv_copyin(void *dest, v_t *src, uint32 n);
 void vv_copy(void *dest, void *src, uint32 n);

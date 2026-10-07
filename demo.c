@@ -189,6 +189,12 @@ void print_usage(char *progname) {
 		 "                    instead of the GPU's free memory\n"
 		 "   stream_frac=X    stream at least fraction X of the matrix\n"
 		 "   stream_slots=X   use X staging buffers for streaming (3)\n"
+		 "   host_check=1     keep the occasional Lanczos check vector\n"
+		 "                    in host memory, borrowing GPU scratch\n"
+		 "   col24=1          pack local column indices into 24 bits\n"
+		 "                    where possible (32-bit fallback)\n"
+		 "   row16=1          compress CSR row pointers with 16-bit\n"
+		 "                    offsets (32-bit fallback for dense groups)\n"
 #endif
 #ifdef HAVE_MPI
 		 "   mpi_nrows=X      use a grid with X rows\n"

@@ -47,6 +47,7 @@ DEPS = ./Makefile \
 	sort_engine.h \
 	spmv_engine.cu \
 	spmv_engine.h \
+	spmv_format.h \
 	$(CUB_DEPS)
 
 LIBNAME = sort_engine
@@ -63,4 +64,3 @@ $(LIBNAME).$(EXT) : $(DEPS)
 
 $(LIBNAME2).$(EXT) : $(DEPS)
 	$(NVCC) $(SM_TARGETS) -o $@ spmv_engine.cu $(NVCCFLAGS) -DVBITS=$(VBITS) $(INC) -O3
-

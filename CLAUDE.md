@@ -21,8 +21,18 @@ CUDA builds on Linux produce one self-contained binary: the CUB sort/SpMV engine
 
 Clean: `make clean`
 
-There are no automated tests. Validation is done by running actual NFS
-factorizations; Greg gates filtering changes on a byte-identical msieve.dat.cyc
+The GPU storage experiments have targeted checks in `tools/test_spmv_packed.cu`
+(independent CPU oracle for all CSR formats and both products) and
+`tools/test_lanczos_packed.py` (isolated synthetic full solves, dependency
+verification, and old/new checkpoint interoperability). The integration test
+creates its own input and polynomial, passes explicit `-i`/`-nf`, and uses
+completed periodic checkpoints instead of stopping at a progress message.
+`tools/test_bench_la.py` checks executable selection with fake programs and
+does not access the GPU. `tools/test_lanczos_interrupt.py` checks that a stop
+signal right after the start or a `-ncr` restart defers to a valid check and
+checkpoint (CPU builds, synthetic job). Build/run instructions
+are in those files. Actual NFS factorizations remain the end-to-end validation;
+Greg gates filtering changes on a byte-identical msieve.dat.cyc
 and msieve.dat.mat for the small and medium jobs under c:/dev/numbers on his
 machine.
 
@@ -36,6 +46,8 @@ The binary is `./msieve`. Key NFS phase flags:
 - `-ncr` — restart Lanczos from checkpoint (`.chk` file)
 - `-t X` — use X threads for linear algebra
 - `-g X` — select GPU index X
+
+SIGINT/SIGTERM during Lanczos runs the integrity check and writes a checkpoint. In non-MPI builds both wait until the check vector is more than three iterations old (after the start, a `-ncr` restart, or the last periodic check), so a stop can take a few extra iterations; MPI builds stop at once without a checkpoint.
 
 NFS options are passed as a quoted string:
 ```
@@ -51,6 +63,13 @@ NFS options are passed as a quoted string:
 ### LA benchmark script
 
 `bench_la.sh` times Lanczos on a prebuilt matrix: `./bench_la.sh -d 90 -a "single_copy=1"` runs `-nc2 "skip_matbuild=1 ..."` on `msieve.dat.mat.90` in its own `bench/<name>-<stamp>/` directory (symlinks to the matrix, so the real job files are never written), measures dims/sec after warmup, stops msieve with SIGTERM (which runs the Lanczos integrity check) and appends a row to `bench/results.tsv`. `-F` instead lets the solve finish and runs `-nc3` in the same directory.
+
+`-b PATH` selects a saved executable for A/B runs, resolving a bare name in
+the current directory. Each run records its absolute path and SHA-256 in
+`executable.txt`, plus `binary_path` in the TSV. `-k` retains benchmark
+checkpoints for restart validation. The summary reports actual matrix MiB and
+upload calls per iteration when the executable supplies transfer counters.
+Do not edit the script during a running benchmark: Bash can reread it.
 
 ## Architecture
 
@@ -105,16 +124,27 @@ Extensions added for NFS@Home distributed factoring workflows, all controlled vi
 **Single-copy GPU matrix** (`common/lanczos/gpu/lanczos_matmul_gpu.c`, `cub/spmv_engine.cu`):
 - `single_copy=1` — stores only A on the GPU, not A^T; the transpose product scatters through A's column-slice blocks with atomic XOR (`spmv_engine_run_trans`). Its block_nnz default is a third of L2 worth of columns, floored at 2×nrows so the per-block row-pointer arrays stay under half the column indices; that saves ~40% of sparse-matrix VRAM on large-L2 cards (less on small-L2 ones). Speed depends on L2: on an RTX 5070 (48MB L2) it was 1.41x faster than two copies at VBITS=64, where both fit at their defaults (1163 vs 825 dims/s); on an RTX 3060 (3MB L2) it was ~19% slower than the two-copy default (251 vs 310 dims/s), and on an A100 MPI piece with 61M rows ~52% slower. The rule behind both losses: single copy only wins when its L2-sized blocks are bigger than its 2×nrows floor; when the floor binds, msieve logs a note that it will only save memory
 - Two-copy block_nnz default: half of L2 worth of columns, floored at max(128M, 12 × max(nrows, ncols) × sizeof(v_t) / 32). The row-proportional part (every block pays for a full row-pointer array and a rewrite of the whole output vector) only matters for tall pieces, e.g. MPI: on the A100 piece above the fixed 128M floor was 13.5% slower than 1.75B
-- `spmv_kernel=auto|segscan|warpmerge` — kernel for all gather SpMV launches (everything but the single-copy scatter). `auto` (default) picks per block: `segscan` (groups of VWORDS lanes per nonzero plus a segmented scan) below 8 nonzeros per row, else `warpmerge` (one warp per row segment)
+- `spmv_kernel=auto|segscan|warpmerge` — kernel for all gather SpMV launches (everything but the single-copy scatter). `auto` (default) picks per block: `segscan` (groups of VWORDS lanes per nonzero plus a segmented scan) below 8 nonzeros per row, else `warpmerge` (one warp per row segment). Tried and rejected for the forward product (2026-10-06): one atomic XOR per nonzero with no scan (24% slower: several atomics hit each row) and a ballot-based scan with fewer shuffles (no gain)
 
 **Streaming matrix blocks from host memory** (`common/lanczos/gpu/lanczos_matmul_gpu.c`: `plan_matrix`, `choose_streamed`, `setup_schedule`, `stream_load`):
-- Automatic: if the sparse blocks don't fit in the GPU's free memory (less the Lanczos vectors and dense rows), an evenly spaced subset stays in pinned host memory and is copied into staging buffers on a separate stream every iteration, ahead of the SpMV that needs it. In single-copy mode the transpose product walks the blocks backwards so the last streamed blocks are reused. The copies are hidden while the streamed bytes per iteration copy faster than the iteration runs; on the C189 matrices they were the limit (~30-35 GB/s), so VBITS=128 (half-size vectors, more of the matrix resident) beat 256
+- Automatic: if the sparse blocks don't fit in the GPU's free memory (less the Lanczos vectors and dense rows), an evenly spaced subset stays in pinned host memory and is copied into staging buffers on a separate stream every iteration, ahead of the SpMV that needs it. In single-copy mode the transpose product walks the blocks backwards, and blocks are reused at both turnarounds, including between iterations. Smaller vectors let more matrix blocks stay resident; VBITS=128 beat 256 on the streamed C189/C190 tests. Earlier inferred copy rates overstated traffic by missing one turnaround's reuse; use the actual transfer counters and the October 4 correction in LANCZOS_OPTIMIZATION_NOTES.md when assessing the bottleneck.
 - `max_gpu_mem=MB` — memory for matrix + vectors, used instead of the free memory and without the margin (to leave headroom, or to claim memory WDDM would give up); `stream_frac=F` — stream at least that fraction (testing); `stream_slots=N` — staging buffers (default 3; fewer are used if 3 don't fit)
 - The whole block layout is planned before building (`plan_matrix`): forward blocks from the column weights, transpose blocks (two-copy) from prefix sums of per-row nonzero counts, using the same size search the old `extract_block_trans` did, so blocks are identical to before, but the transpose no longer rescans every nonzero at each search step. `gpu_matrix_init` builds exactly the planned blocks. Streamed blocks are packed straight into pinned memory; if pinning fails (WSL limits it), that block stays in ordinary memory with a warning and copies more slowly
 - A margin only decides how much to stream once streaming is unavoidable: 256MB natively, 1.5GB under WDDM (native Windows or WSL, detected via `/dev/dxg`). A matrix that fits without it is loaded whole, as before. If no streaming layout fits, it warns and tries to load the whole matrix. Not used with `use_managed=1` (the streaming options are ignored with a note)
 - On WSL with other GPU users (e.g. a browser), a matrix that fits still fills the card; with it nearly full, WDDM moved memory around and a C189 run got 3x slower, then hit NVIDIA driver faults. Use `max_gpu_mem` (e.g. 8500-10000 on a 12GB card) to keep headroom, or move other apps to an integrated GPU
 - Several MPI ranks sharing one GPU each plan against the same free memory; give each rank its own `max_gpu_mem` share there
 - Staging buffers are as large as the largest streamed block (up to 3 of them), so big blocks (e.g. VBITS=64 single-copy, or two-copy with the row floor) cost a lot of resident space when streaming; capping block size while streaming would trade that against per-block row-pointer overhead, untested
+
+### Experimental GPU storage
+
+These options are opt-in and can be combined:
+- `host_check=1` keeps the check vector `v0` in pinned host memory and borrows the existing SpMV scratch vector for its occasional inner products, including the first three iterations. It is a separate check-vector representation, never a `gpuvec_t` without a device allocation; uploads occur explicitly at its two product call sites. Checkpoint format and integrity checks are unchanged. The planner reserves one fewer GPU vector.
+- `col24=1` stores block-relative column indices in three bytes when the block has at most 2^24 columns; wider blocks retain uint32 indices. Kernels decode indices directly, so resident blocks and streamed buffers stay compact.
+- `row16=1` stores each group of 128 CSR pointers as a uint32 base and 16-bit offsets, with uint32 offsets for groups spanning more than 65535 entries. The terminal pointer and empty rows are retained. A host planning pass determines exact encoded sizes before residency is chosen; formats that would expand retain raw pointers.
+- Sequential kernel cursors cache each 128-pointer group's metadata; compile SpMV with `-DSPMV_CACHE_ROW_GROUPS=0` for an uncached control. Narrow offsets are read and written through uint32 words (no uint16 aliasing). Two-copy row16 planning counts columns with OpenMP and honors `-t`. Validation status (MPI not yet validated) and all benchmark results are in LANCZOS_OPTIMIZATION_NOTES.md.
+- Packed formats require the optional `spmv_engine_run_packed` entry point (and `spmv_engine_run_trans_packed` for single-copy). The old SpMV ABI remains available; requesting compression with an older override library reports an error.
+- What to use: on the C190 matrix (25.2M dims, 12GB 5070, VBITS=128, single copy, streaming) `col24=1` was fastest. It cuts uploads enough that the copies hide behind the SpMV and the run becomes kernel-bound, so `row16=1` and `host_check=1`, which only save memory and uploads, gained nothing there, and row16's decoding made the kernels ~15% slower. Those two only pay when a run is still copy-bound after col24 (bigger matrices or a smaller card). Benchmark other cards before choosing settings; numbers are in LANCZOS_OPTIMIZATION_NOTES.md.
+- Matrix transfer counters count actual HtoD uploads, including prefetches, in complete forward/transpose pairs inside the GPU layer. They exclude the first three pairs (including initialization on a fresh solve), omit standalone dependency-verification multiplies, and print one aggregate when the GPU matrix is freed. Resident and managed-memory runs print no transfer summary. Old estimates based on streamed bytes or one-turnaround reuse overcounted transfers; see the 2026-10-04 correction in `LANCZOS_OPTIMIZATION_NOTES.md`. These counters measure bytes, not exposed GPU copy-wait time.
 
 ### Key data structures
 
