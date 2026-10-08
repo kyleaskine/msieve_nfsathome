@@ -1931,3 +1931,304 @@ when no block would end up packed.
 
 The root `./msieve` (built 2026-10-05 05:54) predates the October 5 review
 follow-up and these fixes; rebuild before production runs.
+
+## Idea: smaller matrices from filtering
+
+Every lever above makes the same matrix cheaper to store or multiply.
+Filtering decides the matrix itself, so it acts on both costs at once.
+Lanczos runs about N/VBITS iterations for an N-dimension matrix, each
+touching every nonzero, so time scales roughly with N x W (W = total
+nonzeros). Memory is the vectors (about 7 x N x VBITS/8 bytes on one GPU,
+plus the dense rows) and the matrix (3-4 bytes per nonzero, plus a
+row-pointer array per block). Two knobs:
+- Target density trades dimensions for weight: higher density gives fewer
+  dimensions (smaller vectors, fewer iterations) but more nonzeros per
+  column (bigger matrix, slower iterations).
+- More relations (oversieving) shrinks both, at the cost of sieving time.
+
+What we have measured, all single copy on the RTX 5070:
+
+| Job | TD | Dims | Sparse nonzeros | dims/s | Full ETA |
+|---|---:|---:|---:|---:|---:|
+| C170 (VBITS=256, resident) | 90 | 13.17M | 1.13B | 1602 | 2h16m |
+| C170 | 110 | 12.31M | | 1635 | 2h05m |
+| C189 (VBITS=128, streaming) | 90 | 23.9M | 2.06B | 774 | 8h34m |
+| C189 | 110 | 22.3M | 2.32B | 753 | 8h14m |
+| C189 | 130 | 21.2M | 2.57B | 700 | 8h24m |
+
+TD 110 was fastest both times, but only by 4-8%. The simple N x W model
+would have picked TD 90 for C189 (49.2 vs 51.7 vs 54.5 x 10^15); it misses
+that while streaming, fewer dimensions also mean smaller vectors and more
+of the matrix resident. The best density depends on the card, and with
+multi-density filtering plus `all_matbuild=1` each candidate is one
+`bench_la.sh -d N` window away.
+
+Not yet explored:
+- How much oversieving shrinks the matrix at a given size. The NFS@Home
+  pastebin logs scraped in `~/code/paste-scraper` (`data/results.csv`,
+  about 4,770 jobs with digits, SNFS/GNFS, unique relations, matrix rows,
+  matrix MB and target density) could fit matrix rows against relations at
+  fixed digits.
+- Whether a different merge gives smaller or lighter matrices from the same
+  relations, e.g. comparing msieve's filtering with CADO-NFS's on one job.
+  Unverified idea.
+
+## 2026-10-07: C191 col24 in both storage modes, TD 110 vs 130
+
+C191 from a `target_density=110,130` filter: TD 110 is 26,691,588 dims with
+2.56B sparse nonzeros, TD 130 is 25,320,748 dims with 2.84B. RTX 5070, WSL,
+VBITS=128, `max_gpu_mem=9500 -t 8`, rebuilt root `./msieve` (October 6 fixes).
+Each window is traced with nsys from launch: 30 s after the first progress
+line, the last 70 s of iterations are analyzed, then SIGTERM. All eight
+passed the integrity check. Scripts: `bench/claude-c191-scripts/`; runs and
+`summary.json` files: `bench/c191-*`.
+
+| TD 110 config | dims/s | ms/iter | Uploaded GB/iter | Copy rate | GPU busy ms/iter |
+|---|---:|---:|---:|---:|---:|
+| single copy | 399.8 | 318.4 | 14.04 | 49.8 GB/s | 221.2 |
+| single copy, col24 (first) | 490.2 | 259.7 | 8.18 | 41.6 GB/s | 236.2 |
+| single copy, col24 (repeat, 32 min later) | 550.4 | 231.3 | 8.18 | 51.2 GB/s | 229.9 |
+| two-copy (default 160M blocks) | 273.0 | 466.0 | 19.56 | 48.1 GB/s | 266.2 |
+| two-copy, col24 | 318.3 | 399.9 | 13.66 | 40.8 GB/s | 293.5 |
+| two-copy, 400M blocks | 211.7 | 601.0 | 21.24 | 47.1 GB/s | 547.7 |
+| two-copy, 400M blocks, col24 | 234.1 | 543.5 | 13.78 | 46.7 GB/s | 512.5 |
+
+- The host-to-GPU copy rate varied from 41 to 51 GB/s between windows with
+  identical settings, which moved the single-copy col24 result by 12%
+  (490.2 vs 550.4). The slow windows were the first one after the filter
+  wrote the matrices and one at 09:10; a single-thread `ecm -pp1` was
+  running throughout (its stage 2 is memory-heavy). Treat single dims/s
+  comparisons of streamed runs as +-10% unless the copy rates match.
+- End to end, col24 helped every mode: single copy +23% to +38% depending on
+  which col24 window, two-copy +17% (its col24 window had the slow copies),
+  400M blocks +11%. Single copy + col24 is the configuration for this card.
+- Kernel time alone (per-block medians): col24 makes segscan slower (single
+  copy forward +7%, the copy-free blocks +5-8%; two-copy default forward
+  +13%, transpose +10%), leaves the scatter unchanged (within 1%), and makes
+  warpmerge at 400M blocks faster (forward -7%, transpose -6%). Every
+  warpmerge launch overlapped a copy and the raw run copied more, so part of
+  that gain may be less interference: call it 0-7%. Blocks of 400M are
+  ~16 nonzeros per row with an input window larger than L2, the closest
+  this card gets to Greg's A100 regime.
+- Density, back to back at equal copy rates: TD 130 521.1 dims/s (244.2
+  ms/iter, 5.2 GB streamed) vs TD 110 550.4 (231.3 ms/iter, 4.7 GB
+  streamed): full ETAs 13h30m vs 13h28m, a tie. TD 110 left the GPU busy
+  229.9 of 231.3 ms; TD 130 237.4 of 244.2, slightly copy-limited.
+
+### VBITS 128 vs 192 vs 256 on the same C191 matrix
+
+VBITS=192 had never run on the GPU. Before the C191 windows it passed the
+SpMV oracle (all formats, both directions, six shapes including the 2^24
+column case) and full synthetic GPU solves with streaming (single copy with
+col24+row16+host_check, and two-copy with col24), dependencies verified
+against the original matrix; VBITS=256 passed the same solves. Builds:
+`bench/claude-v192-20261007/`, `bench/claude-v256-20261007/` (same sources as
+the root build). TD 110, single copy, `max_gpu_mem=9500 col24=1`, default
+block sizes, run back to back with the 128 control first and last; copy
+rates were 49.9-50.5 GB/s in every window, all integrity checks passed.
+
+| VBITS | Options | Blocks (nnz each) | Streamed | dims/s | ms/iter | GPU busy | Uploaded GB/iter |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 128 | col24 (first) | 26 (100.7M) | 12, 4.7 GB | **540.1** | 235.5 | 233.7 | 8.18 |
+| 128 | col24 (last) | 26 | 12, 4.7 GB | **542.8** | 234.4 | 233.2 | 8.18 |
+| 192 | col24 | 39 (64.7M) | 26, 7.3 GB | 491.0 | 389.4 | 382.1 | 14.29 |
+| 192 | col24 row16 host_check | 39 | 19, 4.5 GB | 433.4 | 441.2 | 439.5 | 8.49 |
+| 256 | col24 | 46 (53.4M) | 37, 9.3 GB | 498.3 | 512.1 | 489.5 | 18.56 |
+| 256 | col24 row16 host_check | 46 | 30, 6.0 GB | 477.9 | 534.3 | 531.8 | 11.95 |
+
+Kernel time per dimension (ms/iteration divided by dims/iteration):
+
+| VBITS | forward SpMV | transpose SpMV | vector ops |
+|---:|---:|---:|---:|
+| 128 | 0.94 | 0.74 | 0.16 |
+| 192 | 1.03 | 0.77 | 0.20 |
+| 256 | 0.95 | 0.74 | 0.24 |
+
+- VBITS=128 won: 8% ahead of 256 and 10% ahead of 192. In every run the
+  GPU was busy at least 96% of the iteration, so copies were hidden at all
+  three widths; this is a kernel comparison.
+- 256's full-sector gathers did not pay here. Its default single-copy
+  blocks are half the size (the L2/3 window holds half as many 32-byte
+  entries), so each iteration walks all 26.7M rows 46 times instead of 26,
+  and that per-block row work cancelled the gather savings: SpMV per
+  dimension came out equal to 128. Its vector operations cost ~45% more
+  per dimension. Larger blocks don't rescue it on this card: the September
+  C170 sweep lost 20% going from 48M to 64M blocks at VBITS=256.
+- 192 has the gather cost of 128 per dimension (24-byte entries straddle
+  32-byte sectors half the time) plus 39 blocks' row work, so its forward
+  product is the slowest per dimension.
+- row16 and host_check only slowed both wider widths: their copies were
+  already hidden, so only row16's decoding showed.
+- For this 12 GB card at ~26M dimensions: VBITS=128, single copy, col24.
+  Recommended for the C191 run: TD 110 with that configuration (projected
+  13h42m at 541.5 dims/s). A smaller C168 is next, which may leave room to
+  try 512 against 256 and 128 with the matrix fully resident.
+
+### C191 production run and the WSL freezes (October 7-8)
+
+Run: TD 130 (25,320,748 dims, 2.84B sparse nonzeros), VBITS=128,
+`single_copy=1 col24=1 -t 8`, root `./msieve` with the October 6 fixes.
+Lanczos needed four starts; three ended early, none for a code reason:
+
+| Segment | Budget | Streamed | Dims covered | Rate | End |
+|---|---|---|---|---:|---|
+| 13:06-18:45 | `max_gpu_mem=10000` | 11 of 25, 4.8 GB | 0 -> 10,050,127 (checkpoint 18:15) | ~543 dims/s | froze 18:45 |
+| 20:02-21:10 | `max_gpu_mem=9500` | 12 of 25, 5.2 GB | -> 10,560,000 (checkpoint 20:18) | ~535 dims/s | froze 21:10 at 12,209,064 |
+| 23:05-23:11 | default (free - 1536 MB) | 12 of 25 | -> 10,675,634 | ~330 dims/s | Ctrl-C (Windows GPU scheduling was off) |
+| 23:15-06:41 | default | 12 of 25 | -> 25,320,746 | **546.9 dims/s** | finished: 28 dependencies |
+
+The final segment uploaded 8,655.9 MiB in 20 copies per iteration
+(BLanczosTime 26,931 s for that segment). Pure Lanczos time at ~545 dims/s
+was about 12.9 hours; the freezes stretched it to about 17.6 hours of wall
+time. TD 130 at the 9500 MB benchmark cap measured 521.1; the production rate
+was ~5% higher.
+
+The freezes:
+- Both times msieve's main thread spun at ~91% CPU, about 70% of it in the
+  kernel (the CUDA driver polling `/dev/dxg`), while the GPU sat idle at
+  6%, 14 W, P8 with its 11.5 GB still allocated. Ctrl-C cannot stop it in
+  that state (the thread never returns from the CUDA call); `kill -9`, then
+  `-ncr` from the last checkpoint.
+- Windows logged nvlddmkm Event ID 153 ("Error occurred on GPUID: 100")
+  at 6:45 PM and 9:10 PM, matching the two freezes: the NVIDIA driver reset
+  the GPU, and the WSL process was left waiting for work that no longer
+  existed. Windows apps recover from such a reset, so nothing visibly
+  crashed. The WSL kernel log showed nothing relevant.
+- Not the 2-second TDR: `TdrDelay` and `TdrDdiDelay` were already 60.
+  Not checkpointing: the freezes came ~30 and ~51 minutes after a
+  checkpoint. The user's GPU-ECM has hung the same way.
+- Changes made: WSL updated (kernel 6.6.87 -> 6.18.40), displays no longer
+  turn off (a blank screensaver instead), hardware-accelerated GPU
+  scheduling briefly turned off. With GPU scheduling off, the same layout
+  ran ~40% slower (~330 dims/s at 99-100% SM utilization, ~180 W instead of
+  the 250 W limit); turning it back on restored full speed. With displays
+  kept on, the final 7h26m segment ran through the night without a freeze.
+  That points at display power-off as the trigger, from one night only.
+- The ~4.5 GB/s GPU-to-host PCIe traffic `nvidia-smi dmon` shows during
+  streaming is normal: read requests for the copy engine's host reads,
+  about a tenth of the 25-55 GB/s inbound. It is not WDDM paging.
+- With `-nc3` on the same command line, Ctrl-C during Lanczos goes straight
+  on to the square root, which failed harmlessly here ("read_cycles can't
+  open dependency file"). A stale `.dep` from another matrix would be used.
+
+Square root: dependencies 1-8 all reached the GCD ("GCD is 1" or "GCD is
+N"), so they were valid squares that split N trivially; dependency 9 gave
+p68 * p123 at 08:38 on October 8:
+22677242890382744370618828743254770649640173390940296665233655349901 *
+952651576690228008247786495474124549513052821401333567352348350806986203843055980770347807873061452273616671405424898966583
+
+## 2026-10-08: C168 with the matrix on the card (density, kernels, VBITS)
+
+The basement C168 matrices from the filtering experiment
+(`bench/c168-quality-m0fm80c8/`): TD 70 9,595,945 dims and 646M nonzeros,
+TD 90 8,777,560 / 747M, TD 110 8,224,520 / 844M, plus the `merge_cost=net`
+TD 70 (9,584,209 dims) and TD 90 (8,770,757). All fit on the 12 GB 5070, so
+nothing streamed: these are kernel and vector-op comparisons. nsys-traced
+windows, 20 s warmup + last 55 s analyzed, single copy unless noted, VBITS
+128 unless noted; each window passed the integrity check. Builds: root
+`./msieve` (128), `bench/claude-v{64,512}-20261008/`, `bench/claude-v{192,256}-20261007/`
+(same sources). VBITS 512 and 64 first passed the SpMV oracle and full
+synthetic GPU solves with verified dependencies. Scripts:
+`bench/claude-c168-scripts/`; runs: `bench/c168-gpu-*`. The C191 square root
+ran on the CPU throughout; one v128 window with 5 ms/iteration of idle GPU
+(1869.9 dims/s, probably host contention) is excluded.
+
+### The automatic kernel choice picks the slower kernel
+
+When these runs were made, `spmv_kernel=auto` used segscan below 8
+nonzeros per row per block (`SEGSCAN_MAX_ROW_MEAN`) and warpmerge above
+(the cutoff is now 28, see below). On this card segscan won every case
+measured, 7 to 24 nonzeros per row:
+
+| Case (TD 90 unless noted) | nnz/row/block | warpmerge | segscan | segscan gain |
+|---|---:|---:|---:|---:|
+| VBITS 128 single, TD 70 | 6.8 | 1866.6 (forced) | 2587.9 | +39% |
+| VBITS 128 single | 9.4 | 1984.7 (auto) | 2529.8 | +27% |
+| VBITS 128 single, TD 110 | 12.0 | 1940.7 (auto) | 2419.9 | +25% |
+| VBITS 128 two-copy | 14.6 | 1744.4 (auto) | 2097.4 | +20% |
+| VBITS 256 two-copy | 14.6 | 1783.4 (auto) | 1907.6 | +7% |
+| VBITS 64 single | 20.3 | 1507.2 (auto) | 1687.7 | +12% |
+| VBITS 512 two-copy | 24.0 | 1498.4 (auto) | 1775.7 | +19% |
+
+dims/s, all col24. Earlier data: on C170 streaming at VBITS 256 (September)
+segscan was +2% at 9.7 and tied at 19.4; on Greg's A100 blocks (29-57 per
+row) forced segscan was 2% slower. The streamed C190/C191 production runs
+had 4-5 nonzeros per row, so auto already chose segscan there. The threshold
+was raised to 28 on October 8: every 5070 case above stays on segscan and
+the A100's ~29-per-row forward blocks stay on warpmerge. The cutoff now lives
+in `cub/spmv_engine.h`, and msieve logs how many blocks it expects on each
+kernel ("SpMV kernel auto: segscan for N of M blocks ..."), so runs before
+and after the change can be told apart in their logs. Any density or VBITS
+comparison at this size needs the kernel pinned (`spmv_kernel=segscan`),
+or it measures the threshold: with auto, TD 70 looked 17% faster than TD 90.
+
+### Density: TD 110 fastest, against the N x W proxy
+
+| | TD 70 | TD 90 | TD 110 |
+|---|---:|---:|---:|
+| VBITS 128, segscan, col24: dims/s | 2587.9 | 2529.8 | 2419.9 |
+| full Lanczos | 61.8 min | 57.8 min | 56.6 min |
+| VBITS 256, col24 (auto = segscan): dims/s | 2593.8 | 2662.0 | 2592.4 |
+| full Lanczos | 61.7 min | 55.0 min | 52.9 min |
+
+The rows x sparse-nonzeros proxy ranked them the other way (TD 70 lowest by
+6-12%). Measured, TD 110 took 8-14% less Lanczos time than TD 70 and 2-4%
+less than TD 90, in line with
+the C189 and C191 measurements: costs that scale with rows (vector
+operations, per-block row work) dominate more than the proxy assumes.
+
+`merge_cost=net` showed no measurable effect: TD 70 -0.9% full time
+(2608.1 vs 2587.9 dims/s, 0.12% fewer dims), TD 90 +0.5% (auto kernel),
+both within the ~1% run-to-run spread. The option was removed the same
+day (see below).
+
+### VBITS and storage with the matrix on the card (TD 90)
+
+| VBITS | single copy | two-copy | notes |
+|---:|---:|---:|---|
+| 64 | 1687.7 (segscan) | 1414.4 (auto) | 5 blocks of 179M |
+| 128 | 2613.6 raw / 2529.8 col24 (segscan) | 2097.4 (segscan) | |
+| 192 | 2483.5 | | |
+| 256 | **2660.2 raw / 2662.0 col24** | 1907.6 (segscan) | 17 blocks of 38M |
+| 512 | 1789.8 | 1775.7 (segscan) | vector ops 124 of 286 ms/iteration |
+
+- VBITS 256 single copy was fastest: 55.0 min for TD 90 against 56.0 min
+  for VBITS 128 without col24. The C191 result (128 ahead) was a streaming
+  result; with everything on the card the full-sector gathers win
+  narrowly.
+- 512 loses ~33%: its vector operations cost 124 ms per iteration, about
+  as much as the whole SpMV.
+- With segscan in both, single copy beat two copies by 21% at VBITS 128
+  (col24 in both) and 40% at 256, and tied at 512. The VBITS 64 pair is
+  not comparable: its two-copy run used warpmerge.
+- col24 on the card: 3.2% slower at VBITS 128 (segscan forward +7.7%:
+  23.9 vs 22.2 ms), unchanged at 256. Use it when the matrix streams
+  (+20-38% on C190/C191), not when it fits.
+- Best measured for this C168: VBITS 256, single copy, TD 110, about 53 min.
+
+## 2026-10-08: Filtering experiments tried and removed
+
+Another model tried two ways to get smaller matrices from the same
+relations, on the basement C168 (artifacts and matrices in
+`bench/c168-quality-m0fm80c8/`):
+- `merge_cost=net`: order the full merge by estimated net nonzero growth,
+  (k-2)(w-2)+1 for an ideal in k relation sets whose lightest has weight w,
+  instead of the Markowitz count (k-1)(w-1). It cut rows x sparse nonzeros
+  by 0.47% at TD 70 and 0.36% at TD 90; on the GPU the full Lanczos time
+  moved -0.9% and +0.5%, within noise.
+- `post_sge`: after the matrix build, eliminate low-degree sparse rows over
+  GF(2), carrying the substitutions into the dense rows and cycle lists. It
+  cut the proxy by at most 0.074% (TD 70, fill limit 64), 0.007% at TD 110:
+  msieve's merge already removes nearly everything that is cheap to remove.
+
+Both were removed before being committed. The October 8 code review had also
+found problems that would have needed fixing (`-nc1` with `post_sge`
+rewriting the `.cyc` that matched the `.mat`, negative tests passing on old
+log text, no `reduce_matrix`-style cleanup of the eliminated matrix). The
+code, tests and documentation are archived in
+`bench/c168-quality-m0fm80c8/removed-code/`.
+
+The useful result from that work was the density comparison it set up: the
+rows x nonzeros proxy ranked TD 70 best, and the GPU measurements above
+ranked it worst. Measure densities on the GPU, with the kernel pinned or the
+threshold fixed, rather than trusting the proxy.

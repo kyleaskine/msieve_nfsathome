@@ -983,6 +983,22 @@ static void plan_matrix(msieve_obj *obj, packed_matrix_t *p,
 		plan_trans_blocks(p, plan);
 	if (d->row16)
 		plan_compressed_rows(p, plan, MAX(1, obj->num_threads));
+
+	/* in auto mode the engine picks a kernel per gather block; log the
+	   split so runs built with different cutoffs can be told apart */
+
+	if (d->spmv_engine_set_kernel != NULL &&
+	    d->spmv_kernel == SPMV_KERNEL_AUTO && plan->num_blocks > 0) {
+		uint32 segscan = 0;
+		for (i = 0; i < plan->num_blocks; i++) {
+			uint32 rows = i < plan->num_forward ? p->nrows : p->ncols;
+			segscan += plan->nnz[i] < (uint64)SEGSCAN_MAX_ROW_MEAN * rows;
+		}
+		logprintf(obj, "SpMV kernel auto: segscan for %u of %u blocks "
+			"(below %u nonzeros per row), warpmerge for %u\n",
+			segscan, plan->num_blocks, SEGSCAN_MAX_ROW_MEAN,
+			plan->num_blocks - segscan);
+	}
 	if (d->col24 || d->row16) {
 		size_t saved = 0;
 		uint32 columns = 0, rows = 0;
@@ -1777,8 +1793,8 @@ void matrix_extra_init(msieve_obj *obj, packed_matrix_t *p,
 
 	/* choose the kernel for the gather products (everything but
 	   the single-copy transpose scatter). By default the engine
-	   picks per block from its nonzeros per row: segscan for the
-	   short row segments of small blocks, warpmerge for long ones.
+	   picks per block from its nonzeros per row: segscan below
+	   SEGSCAN_MAX_ROW_MEAN (spmv_engine.h), warpmerge above.
 	   Override with spmv_kernel=segscan|warpmerge */
 
 	if (d->spmv_engine_set_kernel != NULL) {
@@ -1796,6 +1812,7 @@ void matrix_extra_init(msieve_obj *obj, packed_matrix_t *p,
 			}
 		}
 		d->spmv_engine_set_kernel(d->spmv_engine, kernel);
+		d->spmv_kernel = kernel;
 		logprintf(obj, "SpMV kernel: %s\n", name);
 	}
 

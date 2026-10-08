@@ -10,7 +10,9 @@ job files are touched) and sends SIGTERM the moment Lanczos starts, and the
 moment a -ncr restart resumes. OLD_MSIEVE is a build without the fix (it
 should fail its forced check); NEW_MSIEVE must defer the stop by up to four
 iterations, write a checkpoint, and resume from it to dependencies that are
-verified against the original matrix. The signal timing relies on CPU
+verified against the original matrix. NEW_MSIEVE must also skip the
+square root when -nc3 follows an interrupted solve, and still start it after
+a completed one; OLD_MSIEVE is only used for the deferral cases. The signal timing relies on CPU
 iterations taking tens of milliseconds: use CPU builds (same VBITS) and the
 default 600000 rows. Expect several minutes for the final full solve.
 """
@@ -46,13 +48,13 @@ def case(name, from_checkpoint=None):
     return prefix
 
 
-def run(binary, prefix, restart=False, stop_on=None):
+def run(binary, prefix, restart=False, stop_on=None, extra=()):
     log = Path(str(prefix) + ".log")
     cmd = [str(binary), "-s", str(prefix), "-l", str(log), "-t", "1",
            "-i", str(work / "worktodo.ini"), "-nf", str(work / "synthetic.fb")]
     if restart:
         cmd.append("-ncr")
-    cmd += ["-nc2", "skip_matbuild=1 dump_interval=10000000"]
+    cmd += ["-nc2", "skip_matbuild=1 dump_interval=10000000", *extra]
     out = open(str(prefix) + ".out", "wb")
     proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=out)
     sent = None
@@ -75,6 +77,7 @@ def run(binary, prefix, restart=False, stop_on=None):
             "restart_at": int(restart_at[-1]) if restart_at else None,
             "signal_sent": sent is not None,
             "chk": Path(str(prefix) + ".chk").exists(),
+            "sqrt": "commencing square root" in text,
             "error": "error:" in text + output}
 
 
@@ -102,14 +105,25 @@ check("new binary, stop right after restart: deferred 4 iterations",
       not r["error"] and r["rc"] == 0 and r["chk"] and r["restart_at"] is not None
       and r["halted"] == r["restart_at"] + 4, r)
 
-# 3. the checkpoint written after a deferred stop resumes to a valid solve
+# 3. with -nc3 on the command line, the interrupted solve must not go on
+#    to the square root (there are no new dependencies to read)
+r = run(new, case("new-sqrt"), stop_on="commencing Lanczos iteration",
+        extra=["-nc3"])
+check("new binary, stop with -nc3: checkpoint, no square root",
+      not r["error"] and r["rc"] == 0 and r["chk"] and not r["sqrt"], r)
+
+# 4. the checkpoint written after a deferred stop resumes to a valid solve,
+#    and with -nc3 a completed solve still goes on to the square root. The
+#    synthetic job has no relations, so the square root itself then fails;
+#    only its start is checked
 prefix = case("new-finish", str(work / "new-restart") + ".chk")
-r = run(new, prefix, restart=True)
+r = run(new, prefix, restart=True, extra=["-nc3"])
 deps_ok = False
-if r["rc"] == 0 and not r["error"]:
+if not r["corrupt"] and Path(str(prefix) + ".dep").exists():
     verify_dependencies(Path(str(prefix) + ".mat"), Path(str(prefix) + ".dep"))
     deps_ok = True
-check("new binary resumes the deferred checkpoint to verified dependencies", deps_ok, r)
+check("new binary resumes the deferred checkpoint to verified dependencies, "
+      "then starts the square root", deps_ok and r["sqrt"], r)
 
 print("ALL PASS" if all(results) else "SOME FAILED")
 sys.exit(0 if all(results) else 1)

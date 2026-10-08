@@ -295,11 +295,8 @@ struct SpmvEngine { int threads_per_block; int warp_items; bool tuned; int kerne
 
 enum { K_WARPMERGE, K_SEGSCAN, K_SCATTER };
 
-// In SPMV_KERNEL_AUTO mode, blocks averaging fewer nonzeros per row than
-// this use segscan, the rest warpmerge
-#ifndef SEGSCAN_MAX_ROW_MEAN
-#define SEGSCAN_MAX_ROW_MEAN 8
-#endif
+// In SPMV_KERNEL_AUTO mode, SEGSCAN_MAX_ROW_MEAN (spmv_engine.h) picks
+// segscan or warpmerge per block
 
 static void spmv_autotune(SpmvEngine* eng, const uint32_t* d_rowptr, int num_rows, uint32_t row_format) {
     if (eng->tuned || num_rows <= 0) return;

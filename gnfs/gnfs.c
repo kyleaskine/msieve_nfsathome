@@ -161,9 +161,19 @@ uint32 factor_gnfs(msieve_obj *obj, mp_t *input_n,
 		}
 	}
 
-	if (obj->flags & MSIEVE_FLAG_NFS_LA)
-		nfs_solve_linear_system(obj, n);
-		
+	/* after linear algebra, only run the square root if that solve
+	   wrote dependencies: an interrupted, failed or build-only run
+	   writes none, and an older .dep belongs to another matrix */
+
+	if (obj->flags & MSIEVE_FLAG_NFS_LA) {
+		if (!nfs_solve_linear_system(obj, n)) {
+			if (obj->flags & MSIEVE_FLAG_NFS_SQRT)
+				logprintf(obj, "linear algebra wrote no "
+					"dependencies; skipping the square root\n");
+			goto finished;
+		}
+	}
+
 	if (obj->flags & MSIEVE_FLAG_NFS_SQRT)
 		factor_found = nfs_find_factors(obj, n, factor_list);
 

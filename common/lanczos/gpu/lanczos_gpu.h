@@ -95,6 +95,7 @@ typedef struct {
 	spmv_engine_run_packed_func spmv_engine_run_packed;
 	spmv_engine_run_packed_func spmv_engine_run_trans_packed;
 	spmv_engine_set_kernel_func spmv_engine_set_kernel;
+	int spmv_kernel;		/* SPMV_KERNEL_* requested */
 	void * spmv_engine;
 
 	/* use managed memory to store the matrix data */

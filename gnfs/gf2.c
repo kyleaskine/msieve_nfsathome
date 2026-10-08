@@ -795,7 +795,7 @@ static uint32 matrix_work_is_final(msieve_obj *obj, const char *work_matrix) {
 }
 
 /*------------------------------------------------------------------*/
-void nfs_solve_linear_system(msieve_obj *obj, mpz_t n) {
+uint32 nfs_solve_linear_system(msieve_obj *obj, mpz_t n) {
 
 	/* convert the list of relations from the sieving
 	   stage into a matrix */
@@ -809,7 +809,7 @@ void nfs_solve_linear_system(msieve_obj *obj, mpz_t n) {
 	uint32 max_ncols;
 	uint32 start_col;
 	uint32 num_dense_rows;
-	uint32 deps_found;
+	uint32 deps_found = 0;
 	uint64 *dependencies;
 	uint32 skip_matbuild = 0;
 	uint32 only_matbuild = 0;
@@ -1163,7 +1163,7 @@ void nfs_solve_linear_system(msieve_obj *obj, mpz_t n) {
 				if (!matrix_work_is_final(obj, work_matrix))
 					remove(work_matrix);
 				savefile_unstage(obj);
-				return;
+				return 0;
 			}
 
 			/* save the reduced matrix on disk; if MPI is configured,
@@ -1274,4 +1274,5 @@ void nfs_solve_linear_system(msieve_obj *obj, mpz_t n) {
 #endif
 	cpu_time = time(NULL) - cpu_time;
 	logprintf(obj, "BLanczosTime: %u\n", (uint32)cpu_time);
+	return deps_found != 0;
 }
