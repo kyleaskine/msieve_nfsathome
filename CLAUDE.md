@@ -72,6 +72,12 @@ checkpoints for restart validation. The summary reports actual matrix MiB and
 upload calls per iteration when the executable supplies transfer counters.
 Do not edit the script during a running benchmark: Bash can reread it.
 
+### LA tune script
+
+`tools/tune_la.sh` compares settings and cards without real job files. It builds VBITS 128 and 256 for the detected GPU, generates synthetic matrices (default 7, 14, 25, 35 and 45M columns) and times single copy, single + col24, two copies and two + col24 on each through `bench_la.sh`. It writes `results.tsv` and a ranked `report.txt` under `bench/tune-<host>-<stamp>/`. `-s 41.6@122` sets a size and density (sparse nonzeros per column in the matrix file: about 68/86/104/122 at TD 70/90/110/130, independent of size), and `-A name=ARGS` adds a setting. Sizes the machine lacks RAM or disk for are skipped. A run msieve cannot fit even by streaming is killed and recorded as NOFIT, because under WDDM it would page GPU memory instead of failing.
+
+`tools/synthmat.c` measures a real `.mat` (`profile`), generates matrices from a profile (`gen`), and prints the per-block row-segment histogram the SpMV kernels see (`blockstats`). Every row gets its profiled weight and picks columns in proportion to their target weights. Column targets follow the profiled distribution, sorted and then alternated light/heavy as `reduce_matrix` leaves them. The lightest row and column weights (3 and 6, the same in the real TD 70, 90 and 110 matrices) stay fixed at any density. At other sizes the heaviest 1% of rows (small-prime ideals) keep their absolute rank and column share, times (size ratio)^-0.1, and the rest of the profile is stretched. `tools/la_profile_td110.txt` comes from the C168 TD 110 matrix. Validation is in LANCZOS_OPTIMIZATION_NOTES.md (2026-10-10). At the profiled size, all 12 configurations tried matched the real C168 within 1.4%. At 26.7M, the streaming plans matched the real C191 and kernel times came within 2-3%.
+
 ## Architecture
 
 This is a C library (`libmsieve.a`) plus a thin demo binary (`demo.c` → `msieve`). The library interface is in `include/msieve.h`.

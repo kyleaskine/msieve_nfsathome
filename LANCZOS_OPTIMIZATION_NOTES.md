@@ -2232,3 +2232,123 @@ The useful result from that work was the density comparison it set up: the
 rows x nonzeros proxy ranked TD 70 best, and the GPU measurements above
 ranked it worst. Measure densities on the GPU, with the kernel pinned or the
 threshold fixed, rather than trusting the proxy.
+
+## 2026-10-10: Synthetic matrices for a Lanczos tune
+
+Goal: a tune (`tools/tune_la.sh`) that times settings on any card without
+real job files, so other people can send comparable results and msieve can
+later pick settings from them. It needs synthetic matrices that the GPU code
+treats like real ones. `tools/synthmat.c` measures a real `.mat`
+(`profile`), generates matrices from a profile (`gen`), and prints the
+per-block row-segment histogram the SpMV kernels see (`blockstats`).
+
+What a real matrix file looks like (C168, TD 70/90/110, 8.2-9.6M columns):
+- 104 dense rows (bit-packed in each column) at about 50% density.
+- Sparse rows sorted by weight, heaviest first (`reduce_matrix` permutes
+  them; 99.9% of neighbors are in order). The heaviest sparse row is in
+  8.7/10.8/12.7% of columns at TD 70/90/110, which is proportional to the
+  column weight. The top 392 sparse rows (what VBITS 256 removes or packs)
+  hold 14.7% of the nonzeros, and the top 10,000 hold 36%.
+- Column weights spread from 6 to 400-600. `reduce_matrix` sorts columns by
+  weight and then swaps every other one end to end
+  (`lanczos_pre.c`, "make heavy columns alternate with light columns"), so
+  the file alternates 6, 270, 6, 269, ...
+
+The generator gives every row its profiled weight. Each row picks
+that many distinct columns with probability proportional to each column's
+target weight, where targets follow the profiled distribution, sorted and
+alternated the same way. That is all it models, apart from a few columns
+that come out below the lightest profiled weight and are topped up. At
+other densities the lightest row and column weights stay at 3 and 6, as in
+the real C168 TD 70, 90 and 110 matrices (until 2026-10-11 they scaled with
+density, giving columns of weight 4 and rows of weight 1 at TD 70). At the profiled size, the
+per-block row-segment histograms (single copy at VBITS 256 and 128, two
+copies, 38M/82M/134M-nonzero blocks) matched the real TD 90 matrix within
+0.1 percentage points in every bin. Real NFS matrices behave like rows
+placed in columns at random in proportion to column weight. The shipped
+profile, `tools/la_profile_td110.txt` (22 KB), is from the C168 TD 110 matrix.
+
+### GPU check at the profiled size
+
+Same binaries (HEAD, VBITS 128 and 256), real and synthetic back to back,
+nsys traces, RTX 5070, `-t 4`, with a CPU job of the user's running
+throughout. dims/s:
+
+| TD 90 setting | VBITS 256 real / synthetic | VBITS 128 real / synthetic |
+|---|---|---|
+| single copy | 2505.5 / 2524.3 | 2496.5 / 2489.9 |
+| two copies | 1760.0 / 1743.0 | 2093.5 / 2087.5 |
+| single, warpmerge forced | 1567.3 / 1578.6 | 1783.7 / 1784.7 |
+| single + col24, streamed (max_gpu_mem) | 2478.5 / 2477.9 | 2065.3 / 2061.8 |
+| two + col24, streamed (max_gpu_mem) | 1766.2 / 1764.1 | 1759.1 / 1755.4 |
+
+TD 70 and TD 110, single copy, VBITS 256: 2470.0 / 2505.2 and
+2481.0 / 2478.7. The worst gap is 1.4% (TD 70), and the rest are within 1%.
+Forward, transpose and vector-op times match within about 1 ms, the
+streamed runs chose the same blocks and uploaded the same GB per iteration,
+and forcing warpmerge cost the same on both (37% at 256, 29% at 128).
+
+### Scaling to other sizes
+
+Stretching the whole profile by rank fraction was wrong. A synthetic
+C191-sized matrix (26.7M columns, 103.82/col, VBITS 128) came out with
+99.6 nonzeros per column after msieve removed the heavy rows, against the
+real C191's 96.0. The stretch spreads the heavy rows thin, while real heavy
+rows are the same small-prime ideals at any size and keep their share of
+each column. As a result, every synthetic run was 4-8% slower than the
+recorded C191 numbers, with 3-11% more uploads. Recorded heads:
+
+| Matrix | Columns | Heaviest sparse rows removed | Share of nonzeros |
+|---|---:|---|---:|
+| C168 TD 110 | 8.2M | top 136 / top 392 | 8.8% / 14.7% |
+| C191 TD 110 | 26.7M | top 136 (VBITS 128) | 7.53% (0.86x) |
+| C199 TD 130 | 41.6M | top 392 (VBITS 256) | 12.83% (0.87x) |
+
+The generator now keeps the first 1% of profiled rows at their absolute
+rank and column share, times (size ratio)^-0.1. It stretches the rest over
+the remaining rows and rescales it to the target weight. That predicts 7.9%
+for the C191 head and 12.5% for the C199 head. At the profiled size nothing
+changes. Rerun against the Oct 7 C191 records:
+
+| VBITS 128, max_gpu_mem=9500 | real C191 | synthetic |
+|---|---|---|
+| sparse part after packing | 96.00/col | 95.66/col |
+| single + col24 | 12 of 26 blocks streamed, 8.18 GB/iter, GPU busy 230-234 ms, 540-550 dims/s (490 in a slow-copy window) | 12 of 26, 8.15 GB/iter, 240 ms, 521 |
+| single copy | 14.04 GB/iter, 221 ms, 399.8 | 14.00 GB/iter, 227 ms, 397.9 |
+| two copies | 19.56 GB/iter, 266 ms, 273.0 (48.1 GB/s copies) | 19.57 GB/iter, 265 ms, 291.5 (51.5 GB/s) |
+
+Streaming plans and upload volumes now match, kernel times are within 2-3%,
+and what remains of the dims/s gap follows copy rates, which varied ±10%
+between sessions on Oct 7 as well. The head model rests on two aggregate
+shares. The next check is the C199 on a 5090 (815 dims/s real at 41.6M,
+TD 130, VBITS 256, `single_copy=1 block_nnz=139000000`).
+
+Density depends on TD, not size. Sparse nonzeros per column in the matrix
+file, from the C168, the C191 and the C199 (whose `all_matbuild` built all
+four densities):
+
+| TD | C168 (8-10M) | C191 (26.7M) | C199 (42-53M) |
+|---|---:|---:|---:|
+| 70 | 68.0 | - | 68.5 |
+| 90 | 86.0 | - | 86.7 |
+| 110 | 103.6 | 103.8 | 104.4 |
+| 130 | - | - | 121.8 |
+
+The 4,786 archived NFS@Home logs agree: median 104-106 per column in every
+size bucket from 5M to 35M since 2022, with TD 110-130 the common settings.
+The tune therefore scales one profile to each size at about 104 per column,
+and `SIZE@W` covers other densities.
+
+### The tune script
+
+`tools/tune_la.sh` builds VBITS 128 and 256 for the detected GPU and
+generates each size in turn (default 7, 14, 25, 35 and 45M columns,
+deleted after use). It times single copy, single + col24, two copies and
+two + col24 with `bench_la.sh` (warmup 30 s, window 90 s, SIGTERM with the
+integrity check). Sizes beyond the machine's RAM (about 1.5x the matrix
+file) or disk are skipped. If msieve logs that it cannot stream the matrix,
+the run is killed and recorded as NOFIT, because the fallback of loading
+everything would page GPU memory under WDDM. The script writes
+`results.tsv` and a per-size ranked `report.txt`. A full default run is
+about 2.5 hours per machine. Generation took 35-45 s for C168 sizes and
+220-250 s at 26.7M (14 GB RAM).
