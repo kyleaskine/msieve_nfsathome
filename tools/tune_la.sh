@@ -136,7 +136,12 @@ for v in $vbits; do
     else
         b=$out/build/v$v
         mkdir -p "$b"
-        (cd "$repo" && git ls-files -z | tar --null -T - -cf -) | tar -xf - -C "$b" || exit 1
+        # tracked files, less any deleted from this checkout
+        ( set -o pipefail
+          cd "$repo" && git ls-files -z | while IFS= read -r -d '' f; do
+              if [ -e "$f" ] || [ -L "$f" ]; then printf '%s\0' "$f"; fi
+          done | tar --null -T - -cf - | tar -xf - -C "$b" ) || {
+            log "copying the source tree failed"; exit 1; }
         log "building VBITS=$v for sm_$arch"
         (cd "$b" && make -j"$(nproc)" all CUDA="$arch" VBITS="$v") > "$b/build.log" 2>&1 || {
             log "build failed, see $b/build.log"; exit 1; }
