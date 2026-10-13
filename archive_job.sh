@@ -11,5 +11,5 @@ density=$1
 mv "msieve.dat.cyc.${density}" msieve.dat.cyc
 mv "msieve.dat.mat.${density}" msieve.dat.mat
 
-tar -cf "archive_${density}.tar.zst" -I 'zstd -22 --ultra -T0' \
+tar -cf "archive_${density}.tar.zst" -I 'zstd -1' \
     msieve.dat.mat msieve.fb msieve.log worktodo.ini

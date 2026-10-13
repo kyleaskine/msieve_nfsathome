@@ -2487,3 +2487,124 @@ that were killed. For example, 25M VBITS 256 two copies comes to about
 36 GB, and 35M VBITS 128 single to about 34 GB. With the 2 GB margin it
 would also have stopped 25M VBITS 128 two copies (about 29.7 GB
 estimated), which got through there, presumably with little to spare.
+
+## 2026-10-13: C207 on the 5070 (density, row16 + host_check), and an RTX 3080 tune
+
+### C207: three densities on the 12 GB 5070
+
+207-digit GNFS (degree 5), 925.1M unique relations, filtered with
+`target_density=90,110,130 all_matbuild=1` (filtering 4h09m, builds about an
+hour). The job itself goes to the 5090. These timings are for comparison.
+`bench_la.sh -W 30 -T 90 -- -t 8` with the root `./msieve` (VBITS 128, built
+Oct 11 15:01, sha256 f25a6b6c...), single copy + col24. VBITS 256 cannot fit
+its vectors on this card at these sizes (10-11.4 GB). All runs passed the
+integrity check.
+
+| TD | Dims | Sparse nonzeros/col (after packing) | Blocks streamed | MiB uploaded/iter | ms/iter | dims/s | Full Lanczos |
+|---|---:|---:|---|---:|---:|---:|---:|
+| 90 | 53.31M | 79.9 | 37 of 40 | 35,578 | 805 | 158.0 | 93h43m |
+| 110 | 49.49M | 96.3 | 43 of 48 | 38,935 | 858 | 148.4 | 92h39m |
+| 130 | 46.77M | 112.3 | 40 of 45 | 39,031 | 851 | 149.4 | 86h55m |
+
+- All three were copy-bound at 43-45 GiB/s, the pinned-copy ceiling of this
+  link, so iteration time followed the bytes uploaded and TD 130 won on
+  having the fewest dimensions. As on the C193, the lowest density lost.
+- At VBITS 128, TD 90 hit the single-copy row floor (block_nnz 106.6M, the
+  L2 fit would be about 84M) and logged the "only saving GPU memory" note.
+- The first TD 110 run measured 48.3 dims/s while another session ran a GPU
+  lattice-sieve benchmark on the same card. The 148.4 above is a rerun with
+  nothing else on the GPU. TD 90's window overlapped by at most 3 s, and
+  TD 130's by none. Row 73 of `bench/results.tsv` is the invalid run.
+
+### row16 and host_check pay off once col24 is still copy-bound
+
+TD 130 again, same binary and window:
+
+| Settings (single copy) | Blocks streamed | Needed on GPU | MiB uploaded/iter | Copy rate | dims/s | Full Lanczos |
+|---|---|---:|---:|---:|---:|---:|
+| col24 | 40 of 45 | 23,146 MB | 39,031 | 44.8 GiB/s | 149.4 | 86h55m |
+| col24 + row16 | 39 of 45 | 19,258 MB | 31,607 | 40.9 GiB/s | 168.7 (+12.9%) | 77h01m |
+| col24 + row16 + host_check | 37 of 45 | 19,258 MB | 29,891 | 39.2 GiB/s | 170.8 (+14.3%) | 76h04m |
+
+- row16 shrank the 45 row-pointer arrays (one full array per block, about
+  187 MB each at 46.8M rows) and saved 3.9 GB of the matrix, cutting uploads
+  by 19%. Its slower decoding cost less than the copies it saved. On the
+  C190 (25.2M, 2026-10-04 and 10-05 sections), col24 alone had already
+  hidden the copies, and row16 only made the kernels slower.
+- host_check moved the check vector to host memory, so 714 MB more of the
+  matrix stayed on the card. Uploads fell another 5.4%, but the time only
+  fell 1.2%, about the run-to-run spread. The copy rate dropped from 44.8 to
+  39.2 GiB/s as uploads fell, so the kernels probably show through now, and
+  removing more bytes gains less.
+- The tune's default settings leave out row16, so they cannot find this.
+  It matters for matrices that still stream heavily after col24.
+
+### C207 TD 130 on the 5090
+
+The job itself runs on the rented 5090 (32 GB, native Linux, 256 MB
+streaming margin). `bench_la.sh -T 90`, default warmup and threads, binaries
+built there from the current source at VBITS 128 and 256. All runs passed
+the integrity check.
+
+| Settings | dims/s | Full Lanczos | ms/iter | Streamed | MiB uploaded/iter |
+|---|---:|---:|---:|---:|---:|
+| VBITS 256 single + col24 | **686.4** | **18h55m** | 371.8 | 3,980 MB | 5,970 (12 uploads) |
+| VBITS 128 single + col24 | 639.0 | 20h19m | 199.1 | none | - |
+| VBITS 128 two + col24 | 487.2 | 26h40m | 261.2 | 12,987 MB | 12,987 (11 uploads) |
+
+- VBITS 256 won by 7.4%. The C199 margin was 13-15%, but that VBITS 128 run
+  had no col24 and different block sizes.
+- VBITS 128 single + col24 fit on the card: 19.1 GB of blocks, 25.4 GB peak
+  VRAM. At 199 ms/iteration it scales from the C199's resident VBITS 128
+  (179 ms at 5.02B nonzeros) by the 12% more nonzeros almost exactly.
+- VBITS 256 streamed about 4 GB at 16 GiB/s, so it is not copy-bound, and
+  row16 would only add decoding cost. Per iteration it was 1.19x the C199's
+  (313 ms at 815 dims/s), a little more than the nonzero ratio.
+- Two copies at VBITS 128 streamed 13 GB at 48.6 GiB/s (the PCIe 5 limit)
+  and lost by 24%.
+- The pre-run estimate from the C199 (700-730 dims/s for VBITS 256 single +
+  col24) came out 2-6% high.
+
+### RTX 3080 default tune (someone else's, WSL)
+
+RTX 3080 10 GB (sm_86, 5 MB L2), driver 595.95, WDDM, 763 MiB in use at the
+start, i7-12700K, 32.6 GB MemTotal in WSL (31.8 GB available). nvidia-smi
+reports a maximum PCIe link of **gen 3** x16. Both the 3080 and the 12700K
+support gen 4, and the local 5070 reports its gen 5 correctly under WSL,
+so the board slot, BIOS or a riser probably limits the link. Defaults: sizes
+7-45M, VBITS 128 and 256, 90 s window, 30 s warmup, `-t 8`. dims/s:
+
+| Size | VBITS 256 two + col24 | VBITS 256 two | VBITS 256 single + col24 | VBITS 256 single | VBITS 128 single | VBITS 128 single + col24 | VBITS 128 two + col24 | VBITS 128 two |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 7M | **1093.7** | 1048.0 | 920.9 | 921.4 | 1010.0 | 941.5 | 815.3 | 801.2 |
+| 14M | **488.7** | 356.3 | 368.5 | 353.3 | 328.7 | 344.7 | 332.6 | 229.2 |
+| 25M | NOFIT | NOFIT | NORAM | NORAM | 82.0 | **106.8** | NORAM | NORAM |
+| 35M, 45M | | | | | | | | |
+
+At 35M and 45M every run was NORAM or NOFIT.
+
+- Two copies win while the matrix fits, as on the 5090 and 3060. Only the
+  5070 prefers single copy there. At 7M, VBITS 256 two + col24 beat single
+  by 19%.
+- At 14M, col24 made two copies 37% faster (356.3 to 488.7). Without it,
+  two copies most likely streamed: the run took 19.9 GB of host RAM against
+  16.8 GB with col24. This answers the open question from the September 30
+  C178 run (14.15M, single copy at the row floor, 446 dims/s): two copies +
+  col24 would probably have been about a third faster there (its density
+  was lower, 73 per column against the tune's 104).
+- At 25M only VBITS 128 single copy ran, and col24 was 30% faster. That run
+  took 22.5 GB of host RAM. Less the matrix (about 11.0 GB) and the host
+  vectors (about 4.1 GB from the October 12 calibration), roughly 7.4 GB
+  streamed. At the C207's 1.9-2 uploads per streamed byte, that is about
+  14 GB in each 1.19 s iteration, about 11-12 GB/s: what a gen 3 x16 link
+  carries. So the 25M runs were probably copy-bound by the link (inferred,
+  no transfer counters in the report). If the September 30 C178 ran on this
+  machine, its ~8 GB/s copies were closer to the link's limit than the
+  "well under PCIe 4.0" noted there.
+- 35M and 45M were all NORAM or NOFIT. WSL takes half of Windows' RAM by
+  default, so this machine probably has 64 GB, and `memory=` in
+  `.wslconfig` could give WSL enough for 35M. On the 5070, 35M VBITS 128
+  single + col24 peaked at 30.8 GB. A 10 GB card streams 2-3 GB more, and
+  the tune keeps 2 GB to spare.
+- In the report, a NORAM row's host RAM is only what loaded before the
+  stop. The estimate that triggered the stop is only in `runs.log`.
