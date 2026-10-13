@@ -29,12 +29,22 @@
 # run whose matrix cannot fit on the card even when streamed is stopped and
 # reported as NOFIT. At the default density a size needs about 0.45 GB of
 # disk per million columns for the matrix (45M columns: ~20 GB) plus a
-# checkpoint at shutdown, and about 1.5x the matrix file in RAM.
+# checkpoint at shutdown, and at least 1.5x the matrix file in RAM. More is
+# needed when the card is small, because blocks streamed from host memory
+# are pinned there. Once msieve has planned its GPU layout, each run's peak
+# (matrix, pinned streamed blocks and host vectors) is estimated. A run
+# that would not fit with 2 GB to spare is stopped before it pins anything,
+# and a run the kernel kills for lack of memory anyway is also reported as
+# NORAM. Available RAM is the smaller of MemAvailable and the headroom under
+# any cgroup (container) memory limit.
 #
 # Example: tools/tune_la.sh -s "7 14" -v 128 -T 60
-# Results: DIR/results.tsv (one row per run) and DIR/report.txt. The run
-# directories under DIR/job/bench keep each msieve log; the matrices are
-# deleted after each size, or when the tune is interrupted, unless -k.
+# Results: DIR/results.tsv (one row per run) and DIR/report.txt. Each run
+# records msieve's peak resident memory and the host memory it took (the
+# largest drop in available RAM during the run, which includes pinned
+# buffers; other programs' use shows up there too). The run directories
+# under DIR/job/bench keep each msieve log; the matrices are deleted after
+# each size, or when the tune is interrupted, unless -k.
 
 sizes="7 14 25 35 45"
 vbits="128 256"
@@ -91,16 +101,124 @@ stamp_glob='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0
 run_dirs() {
     (cd "$out/job" && for d in bench/"$1"-$stamp_glob; do [ -d "$d" ] && echo "$d"; done)
 }
-# send signal $1 to the current run's msieve, identified by its working
-# directory and run directory, so other tunes and msieve jobs are untouched
-stop_run() {
+# the current run's msieve, identified by its working directory and run
+# directory, so other tunes and msieve jobs are never touched
+run_pids() {
     local p
     [ -n "$run" ] || return
     for p in /proc/[0-9]*; do
         [ "$p/cwd" -ef "$out/job" ] &&
             tr '\0' '\n' 2>/dev/null < "$p/cmdline" | grep -qxF -- "$run/msieve.dat" &&
-            kill -"$1" "${p#/proc/}" 2>/dev/null
+            echo "${p#/proc/}"
     done
+}
+stop_run() {
+    local p
+    for p in $(run_pids); do kill -"$1" "$p" 2>/dev/null; done
+}
+
+# This process's cgroup directory: cgroup v2, else the v1 memory hierarchy.
+# Prints "DIR ROOT V" (V = 2 or 1), nothing if neither is readable.
+cg_dir() {
+    local p
+    p=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' /proc/self/cgroup 2>/dev/null)
+    if [ -n "$p" ] && [ -r /sys/fs/cgroup/cgroup.controllers ]; then
+        echo "/sys/fs/cgroup${p%/} /sys/fs/cgroup 2"
+        return
+    fi
+    p=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ { print $3; exit }' /proc/self/cgroup 2>/dev/null)
+    [ -n "$p" ] && [ -d /sys/fs/cgroup/memory ] &&
+        echo "/sys/fs/cgroup/memory${p%/} /sys/fs/cgroup/memory 1"
+}
+# MB that can still be used under cgroup memory limits (the tightest of
+# this cgroup and its ancestors, page cache counted as free); empty if
+# there is no limit. In a container the root is the container's cgroup.
+cg_headroom() {
+    local d root v lim cur rec h best=""
+    read -r d root v <<< "$(cg_dir)"
+    [ -n "$d" ] || return
+    while :; do
+        if [ "$v" = 2 ]; then
+            lim=$(cat "$d/memory.max" 2>/dev/null)
+            [ "$lim" = max ] && lim=""
+            cur=$(cat "$d/memory.current" 2>/dev/null)
+            rec=$(awk '$1 == "active_file" || $1 == "inactive_file" { s += $2 } END { print s + 0 }' \
+                "$d/memory.stat" 2>/dev/null)
+        else
+            lim=$(cat "$d/memory.limit_in_bytes" 2>/dev/null)
+            # no limit reads as about 2^63
+            [ -n "$lim" ] && [ "${#lim}" -ge 19 ] && lim=""
+            cur=$(cat "$d/memory.usage_in_bytes" 2>/dev/null)
+            rec=$(awk '$1 == "total_active_file" || $1 == "total_inactive_file" { s += $2 } END { print s + 0 }' \
+                "$d/memory.stat" 2>/dev/null)
+        fi
+        if [ -n "$lim" ] && [ -n "$cur" ]; then
+            h=$(( (lim - cur + rec) / 1048576 ))
+            if [ -z "$best" ] || [ "$h" -lt "$best" ]; then best=$h; fi
+        fi
+        [ "$d" = "$root" ] || [ "${d#"$root"/}" = "$d" ] && break
+        d=${d%/*}
+    done
+    echo "$best"
+}
+# MB of RAM available: MemAvailable, or less under a cgroup limit
+mem_avail() {
+    local a h
+    a=$(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo)
+    h=$(cg_headroom)
+    if [ -n "$h" ] && [ "$h" -lt "$a" ]; then a=$h; fi
+    echo "$a"
+}
+# MB msieve keeps free on the card while streaming, for nc2 arguments $1
+gpu_margin() {
+    case " $1 " in
+        *" max_gpu_mem="*) echo 0 ;;
+        *) if [ -e /dev/dxg ]; then echo 1536; else echo 256; fi ;;
+    esac
+}
+# Peak host memory of a run in MB, once msieve has logged its GPU layout
+# ("GPU memory:"); nothing before that. Prints "TOTAL MATRIX STREAMED
+# VECTORS": the matrix as loaded, the blocks it will pin in host memory
+# (what does not fit in the GPU budget once up to three staging buffers
+# are set aside), and host vectors and work space, which measured 9.6-10.2
+# bytes per column per VBITS/8. Calibrated on the 5070 at 25M and 35M
+# (LANCZOS_OPTIMIZATION_NOTES.md, 2026-10-12), where it ran 0.5-1 GB high.
+# Arguments: LOG VBITS MARGIN_MB
+ram_estimate() {
+    awk -v vb="$2" -v margin="$3" '
+        /matrix is [0-9]+ x [0-9]+ \(/ && m == "" {
+            s = $0; sub(/ MB\).*/, "", s); sub(/.*\(/, "", s); m = s + 0
+            s = $0; sub(/.* x /, "", s); nc = s + 0 }
+        /nonzeros per matrix block:/ { bnz = $NF + 0 }
+        /GPU memory:/ { g = $0 }
+        END {
+            if (g == "" || m == "") exit
+            s = g; sub(/.*vectors, /, "", s); avail = s + 0
+            s = g; sub(/.*blocks \(/, "", s); need = s + 0
+            streamed = 0
+            if (need > avail) {
+                budget = avail > margin ? avail - margin : 0
+                streamed = need - budget + 3 * 1.1 * (bnz * 4 + nc * 4) / 1048576
+                if (streamed > need) streamed = need
+            }
+            vec = 10.5 * nc * vb / 8 / 1048576
+            printf "%d %d %d %d\n", m + streamed + vec, m, streamed, vec
+        }' "$1" 2>/dev/null
+}
+# processes killed for lack of memory so far: this cgroup's count (which
+# includes its descendants), else the whole system's; empty if unknown
+oom_count() {
+    local d root v n=""
+    read -r d root v <<< "$(cg_dir)"
+    if [ "$v" = 2 ]; then
+        n=$(awk '$1 == "oom_kill" { print $2 }' "$d/memory.events" 2>/dev/null)
+        # a container may only show its own cgroup, at the root
+        [ -n "$n" ] || n=$(awk '$1 == "oom_kill" { print $2 }' "$root/memory.events" 2>/dev/null)
+    elif [ "$v" = 1 ]; then
+        n=$(awk '$1 == "oom_kill" { print $2 }' "$d/memory.oom_control" 2>/dev/null)
+    fi
+    [ -n "$n" ] || n=$(awk '$1 == "oom_kill" { print $2 }' /proc/vmstat 2>/dev/null)
+    echo "$n"
 }
 run="" partial="" cur_mat=""
 on_exit() {
@@ -119,6 +237,8 @@ trap 'exit 143' TERM
     nvidia-smi -i "$gpu" --query-gpu=name,memory.total,memory.used,driver_version,compute_cap,pcie.link.gen.max,pcie.link.width.max --format=csv
     if [ -e /dev/dxg ]; then echo "WDDM: yes (/dev/dxg)"; else echo "WDDM: no"; fi
     grep -E 'MemTotal|MemAvailable' /proc/meminfo
+    h=$(cg_headroom)
+    [ -n "$h" ] && echo "cgroup memory limit: $h MB still free under it"
     lscpu | grep -E 'Model name|^CPU\(s\)'
     uname -r
     echo "sizes: $sizes; VBITS: $vbits; window ${window}s, warmup ${warmup}s, -t $threads"
@@ -159,7 +279,12 @@ printf 'N %s\nSKEW 1\nR0 -2\nR1 1\nA0 %s\nA1 0\nA2 0\nA3 1\n' "$n" \
     > "$out/job/msieve.fb"
 
 results=$out/results.tsv
-[ -f "$results" ] || printf "size\tncols\tweight\tvbits\tsetting\tstatus\tdims_per_sec\teta_full\tms_per_iter\tsparse_mb\tstreamed_mb\tcopied_mib_per_iter\tpeak_vram_mib\tbase_vram_mib\trun_dir\n" > "$results"
+if [ ! -f "$results" ]; then
+    printf "size\tncols\tweight\tvbits\tsetting\tstatus\tdims_per_sec\teta_full\tms_per_iter\tsparse_mb\tstreamed_mb\tcopied_mib_per_iter\tpeak_vram_mib\tbase_vram_mib\trun_dir\tpeak_rss_mib\thost_mem_mib\n" > "$results"
+elif ! head -1 "$results" | grep -q host_mem_mib; then
+    # from before the memory columns
+    sed -i '1s/$/\tpeak_rss_mib\thost_mem_mib/' "$results"
+fi
 gthreads=$(nproc); [ "$gthreads" -gt 16 ] && gthreads=16
 pweight=$(awk 'NR == 2 { printf "%.2f", $4 / $3 }' "$profile")
 
@@ -172,7 +297,7 @@ for spec in $sizes; do
     read -r file_mb gen_mb run_mb <<< "$(awk -v c="$ncols" -v w="$weight" -v t="$gthreads" 'BEGIN {
         file = (c * w * 4 + c * 20) / 1048576
         printf "%d %d %d", file, (c * w * 4 + c * (4 * t + 64)) / 1048576, file * 1.5 }')"
-    avail=$(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo)
+    avail=$(mem_avail)
     disk=$(df -Pm "$out" | awk 'NR == 2 { print $4 }')
     need=$(( gen_mb > run_mb ? gen_mb : run_mb ))
     reason=""
@@ -191,7 +316,7 @@ for spec in $sizes; do
     if [ -n "$reason" ]; then
         log "skipping $label: $reason"
         for v in $vbits; do for c in $configs; do
-            printf "%s\t%s\t%s\t%s\t%s\tSKIP\t-\t-\t-\t-\t-\t-\t-\t-\t%s\n" "$label" "$ncols" "$weight" "$v" "$c" "$reason" >> "$results"
+            printf "%s\t%s\t%s\t%s\t%s\tSKIP\t-\t-\t-\t-\t-\t-\t-\t-\t%s\t-\t-\n" "$label" "$ncols" "$weight" "$v" "$c" "$reason" >> "$results"
         done; done
         continue
     fi
@@ -202,6 +327,7 @@ for spec in $sizes; do
             log "$label VBITS=$v $c: ${SETTING[$c]:-(defaults)}"
             # run directories left by an earlier tune in this -o
             before=$(run_dirs "$name")
+            oom0=$(oom_count) avail0=$(mem_avail)
             (cd "$out/job" && "$repo/bench_la.sh" -d "$label" -b "${BIN[$v]}" \
                 -a "${SETTING[$c]}" -T "$window" -W "$warmup" -g "$gpu" \
                 -n "$name" -- -t "$threads") >> "$out/runs.log" 2>&1 &
@@ -209,19 +335,52 @@ for spec in $sizes; do
             # with no layout that fits, msieve tries to load the whole
             # matrix; under WDDM that pages GPU memory instead of failing.
             # The log is checked once more after the run has ended.
-            nofit=0 run=""
+            nofit=0 noram="" est="" run="" mpid="" rss=0 amin=$avail0
+            margin=$(gpu_margin "${SETTING[$c]}")
             while :; do
                 alive=0; kill -0 $bpid 2>/dev/null && alive=1
                 [ -n "$run" ] || run=$(run_dirs "$name" | grep -vxF -e "$before" | tail -1)
+                # peak memory: msieve's own (VmHWM), and the drop in
+                # available RAM, which also counts its pinned buffers
+                if [ -z "$mpid" ] || [ ! -d "/proc/$mpid" ]; then mpid=$(run_pids | head -1); fi
+                if [ -n "$mpid" ]; then
+                    h=$(awk '/^VmHWM:/ { print int($2 / 1024) }' "/proc/$mpid/status" 2>/dev/null)
+                    if [ -n "$h" ] && [ "$h" -gt "$rss" ]; then rss=$h; fi
+                fi
+                a=$(mem_avail)
+                if [ "$a" -lt "$amin" ]; then amin=$a; fi
                 if [ -n "$run" ] && grep -qs 'cannot stream the matrix' "$out/job/$run/msieve.log"; then
                     nofit=1
                     stop_run KILL
                     break
                 fi
+                # once msieve has planned its GPU layout, and before it
+                # pins the streamed blocks, stop a run whose peak would not
+                # fit in the RAM that was available when it started, with
+                # 2 GB to spare (the drop in available RAM ran up to 1.2 GB
+                # above the estimate in calibration)
+                if [ -z "$est" ] && [ -n "$run" ]; then
+                    read -r est est_m est_s est_v <<< \
+                        "$(ram_estimate "$out/job/$run/msieve.log" "$v" "$margin")"
+                    if [ -n "$est" ] && [ $(( est + 2048 )) -gt "$avail0" ]; then
+                        # a layout that cannot fit on the card at all is NOFIT
+                        sleep 1
+                        if grep -qs 'cannot stream the matrix' "$out/job/$run/msieve.log"; then
+                            nofit=1
+                        else
+                            noram="needs ~$est MB at its peak (matrix $est_m, streamed blocks $est_s, vectors $est_v), $avail0 MB available"
+                        fi
+                        stop_run KILL
+                        break
+                    fi
+                fi
                 [ $alive = 1 ] || break
-                sleep 2
+                sleep 1
             done
             wait $bpid
+            host_mem=$(( avail0 - amin ))
+            [ "$host_mem" -ge 0 ] || host_mem=0
+            oom1=$(oom_count)
             # this run's row, matched by name and run directory
             row=""
             [ -n "$run" ] && row=$(awk -F'\t' -v n="$name" -v d="$run" '$2 == n && $13 == d' \
@@ -230,12 +389,22 @@ for spec in $sizes; do
                 row=$(printf 'x\t%s\tx\tx\tFAIL\t-\t-\t-\t-\t-\t-\tx\t%s\t-\t-' "$name" "${run:--}")
             st=$(printf '%s\n' "$row" | cut -f5)
             [ "$nofit" = 1 ] && st=NOFIT
+            if [ -n "$noram" ]; then
+                log "  stopped before pinning host memory: $noram"
+                st=NORAM
+            fi
+            # killed for lack of host memory (by the kernel, not this script)
+            if [ -n "$oom0" ] && [ -n "$oom1" ] && [ "$oom1" -gt "$oom0" ]; then
+                log "  the kernel killed $(( oom1 - oom0 )) process(es) for lack of memory during this run"
+                [ "$st" = FAIL ] && st=NORAM
+            fi
             printf '%s\n' "$row" | awk -F'\t' -v OFS='\t' -v lab="$label" -v nc="$ncols" \
-                -v w="$weight" -v vb="$v" -v c="$c" -v st="$st" -v base="$out/job/" '
+                -v w="$weight" -v vb="$v" -v c="$c" -v st="$st" -v base="$out/job/" \
+                -v rss="$rss" -v hm="$host_mem" '
                 { print lab, nc, w, vb, c, st, $6, $7, $8, $9, $14, $15, $10, $11,
-                        ($13 == "-" ? "-" : base $13) }' >> "$results"
+                        ($13 == "-" ? "-" : base $13), (rss > 0 ? rss : "-"), hm }' >> "$results"
             rate=$(printf '%s\n' "$row" | cut -f6); eta=$(printf '%s\n' "$row" | cut -f7)
-            log "  $st: $rate dims/s, full run $eta"
+            log "  $st: $rate dims/s, full run $eta, host memory ~$host_mem MB (msieve resident $rss MB${est:+, estimated $est MB})"
         done
     done
     [ "$keep" = 1 ] || rm -f "$mat"
@@ -248,7 +417,8 @@ done
     echo
     awk -F'\t' 'NR > 1 {
         key = $1; if (!(key in seen)) { seen[key] = 1; order[++n] = key }
-        line[key] = line[key] sprintf("%s\t%s\t%s\t%s\t%s\n", $7 == "-" ? 0 : $7, $4, $5, $6, $8)
+        line[key] = line[key] sprintf("%s\t%s\t%s\t%s\t%s\t%s\n", $7 == "-" ? 0 : $7, $4, $5, $6, $8,
+                                      $17 == "" ? "-" : $17)
     } END {
         for (i = 1; i <= n; i++) {
             printf "size %s\n", order[i]
@@ -259,8 +429,8 @@ done
         }
     }' "$results" | awk -F'\t' '/^size/ { print; best = ""; next }
         { if (best == "" && $1 > 0) { best = $1; mark = " <- best" } else mark = ""
-          printf "  VBITS %-4s %-14s %-5s %9s dims/s  full run %s%s\n", $2, $3, $4,
-                 ($1 > 0 ? $1 : "-"), $5, mark }'
+          printf "  VBITS %-4s %-14s %-5s %9s dims/s  full run %-7s host RAM %6s MB%s\n", $2, $3, $4,
+                 ($1 > 0 ? $1 : "-"), $5, $6, mark }'
 } > "$out/report.txt"
 log "done; report in $out/report.txt"
 cat "$out/report.txt"

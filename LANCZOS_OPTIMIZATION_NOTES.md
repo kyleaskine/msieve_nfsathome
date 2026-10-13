@@ -2352,3 +2352,138 @@ everything would page GPU memory under WDDM. The script writes
 `results.tsv` and a per-size ranked `report.txt`. A full default run is
 about 2.5 hours per machine. Generation took 35-45 s for C168 sizes and
 220-250 s at 26.7M (14 GB RAM).
+
+## 2026-10-11: First tune reports, and a C193 set up from real-matrix timings
+
+### Default tune on three cards
+
+Best setting per size from `tools/tune_la.sh` with defaults (dims/s):
+
+| Size | RTX 5070 (12 GB, WSL) | RTX 5090 (32 GB) | RTX 3060 (12 GB) |
+|---|---|---|---|
+| 7M | VBITS 256 single: 3234 | VBITS 256 two + col24: 8885 | VBITS 256 two + col24: 654 |
+| 14M | VBITS 256 single: 1404 | VBITS 256 two + col24: 4046 | VBITS 256 two + col24: 306 |
+| 25M | VBITS 128 single + col24: 647 | VBITS 256 single + col24: 1971 | VBITS 256 single + col24: 104 (VBITS 128 two + col24: 101) |
+| 35M | VBITS 256 single + col24: 324 | VBITS 256 single + col24: 1164 (VBITS 128 two + col24: 1136) | failed |
+| 45M | VBITS 128 single + col24: 185 | VBITS 128 two + col24: 791 (VBITS 256 single + col24: 780) | failed |
+
+- While the matrix fits on the card, two copies win on the 5090 and the
+  3060 (single copy 7-8% and 25-30% behind), but single copy wins on the
+  5070. No single VBITS or setting is best on all three cards.
+- Once matrices stream, single + col24 usually leads, and which VBITS wins
+  changes with size and card.
+- On the 5070, VBITS 256 cannot fit its vectors at 45M (9.6 GB), and two
+  copies at VBITS 256 is NOFIT from 35M (the row floor makes 420M-nonzero
+  blocks too big to stage).
+- The 3060 failed nearly every run at 35M and 45M, and VBITS 256 two copies
+  at 25M, because it ran out of host memory. Its container has a 30 GiB
+  cgroup limit. `memory.peak` reached that limit and `memory.events`
+  counted 12 kills for 13 failed runs. Other jobs were also running there,
+  and the tune saw 12.3 GB available at the start. No failed run logged an
+  error. Each stopped either while packing streamed blocks into pinned
+  host memory (last line "leaving 256 MB of GPU memory free while
+  streaming") or just after "commencing Lanczos iteration". The tune's RAM
+  estimate (1.5x the matrix file) leaves out the pinned host copy of
+  streamed blocks. On a 12 GB card that adds 7-20 GB at 35M; the 5070's
+  35M logs show 13 GB (VBITS 128 single) to 27 GB (VBITS 128 two) on top of
+  msieve's own 9.4 GB. Since Oct 12 the tune also checks the cgroup limit,
+  records kernel kills as NORAM (from `memory.events`, else
+  `/proc/vmstat`), and records each run's peak resident memory and the host
+  memory it took. It also stops runs that would not fit before they pin
+  anything (calibration below).
+- C199 check on the 5090 (Oct 12, `-s 41.646178@121.79 -v 256 -c single
+  -A "c199=single_copy=1 block_nnz=139000000"`): the synthetic matrix with
+  the real run's settings gave 818.9 dims/s against the real C199's 815
+  (+0.5%). msieve's default single-copy block size gave 826.3, so the
+  hand-picked `block_nnz` gained nothing. Together with the C191 recheck,
+  this means the size scaling of the heavy rows holds from 8M to 41.6M.
+  The streaming plan matched too: 4 of 32 blocks streamed, as in the real
+  run (2,756 MB through two 689 MB buffers). The default block size
+  streamed 6 of 40 (3,511 MB) and was still 1% faster.
+
+### C193: choosing density and VBITS on the real matrices
+
+193-digit GNFS (degree 5), 521.6M unique relations, filtered with
+`target_density=90,110,130 all_matbuild=1`. Filtering plus the three
+matrix builds took 5h06m, of which the builds took 74 min. Each matrix was then timed with
+`bench_la.sh` (warmup 30 s, window 90 s, `-t 8`) using the tune's
+current-source VBITS 128 and 256 builds, with ECM running on the CPU and
+the default 1.5 GB WDDM margin. All six runs passed the integrity check.
+
+| TD | Dims | Sparse nonzeros/col | VBITS 128 single + col24 | VBITS 256 single + col24 |
+|---|---:|---:|---|---|
+| 90 | 31.88M | 86.1 | 455.9 dims/s, 19h25m | 398.2 dims/s, 22h14m |
+| 110 | 29.82M | 103.8 | 446.7 dims/s, 18h32m | 444.3 dims/s, 18h38m |
+| 130 | 28.31M | 121.1 | 422.5 dims/s, 18h36m | 413.1 dims/s, 19h02m |
+
+- TD 110 and 130 tie within noise; TD 90 has the fastest iterations, but
+  its 2M extra dimensions cost about an hour.
+- Upload volume does not decide VBITS. At TD 90, VBITS 256 uploaded 12%
+  less per dimension (78.0 vs 88.7 MiB) and was still 13% slower, so both
+  are partly kernel-bound at this size. An automatic choice should use
+  measured rates, not upload volume.
+- The synthetic tune brackets the result: VBITS 128 single + col24 gave
+  647 dims/s at 25M and 311 at 35M, against 446.7 here at 29.8M. A
+  synthetic matrix of exactly this size was not run.
+
+Production run: TD 110, VBITS 128, single copy + col24, `-t 8`, root
+`./msieve` rebuilt at 15:01 on Oct 11. 17 of 29 blocks streamed, with
+11,855.8 MiB uploaded per iteration, identical to the benchmark. Lanczos
+ran from 15:04:50 to 09:45:02: 18h40m12s, 443.6 dims/s, 0.7% below the
+benchmark's 446.7 (it predicted 18h32m). BLanczosTime was 67,373 s over
+234,356 iterations, with 30 dependencies. The square root took 21m45s
+and found p70 x p123. Elapsed for `-nc2`/`-nc3` was 19h04m39s.
+
+## 2026-10-12: Host memory of streamed runs (tune calibration)
+
+Synthetic 25M and 35M matrices (103.6 nonzeros per column), RTX 5070 with
+80 GB of RAM and the 1.5 GB WDDM margin, short windows
+(`tools/tune_la.sh -s "25 35" -c "single single-col24 two" -A
+"single-6g=single_copy=1 max_gpu_mem=6000" -T 20 -W 10`). Peak is msieve's
+VmHWM. Pinned memory counts there: it matched the drop in available RAM
+within 0.2-2 GB. "Extra" is the peak minus the matrix and the streamed
+blocks. All memory figures are in MB.
+
+| Run | Matrix | Needed on GPU | Streamed | Peak | Extra | Extra per column / (VBITS/8) |
+|---|---:|---:|---:|---:|---:|---:|
+| 25M VBITS 128 single | 11,023 | 11,434 | 6,140 | 21,066 | 3,902 | 10.2 |
+| 25M VBITS 128 single + col24 | 11,023 | 9,159 | 3,815 | 18,732 | 3,893 | 10.2 |
+| 25M VBITS 128 two | 11,023 | 21,407 | 16,813 | 31,741 | 3,904 | 10.2 |
+| 25M VBITS 128 single, 6 GB cap | 11,023 | 11,434 | 9,478 | 24,412 | 3,910 | 10.3 |
+| 25M VBITS 256 single | 11,023 | 12,961 | 10,296 | 28,714 | 7,394 | 9.7 |
+| 25M VBITS 256 single + col24 | 11,023 | 10,816 | 8,104 | 26,506 | 7,378 | 9.7 |
+| 25M VBITS 256 two | 11,023 | 18,717 | 18,021 | 36,384 | 7,339 | 9.6 |
+| 35M VBITS 128 single | 15,432 | 17,379 | 13,182 | 34,068 | 5,453 | 10.2 |
+| 35M VBITS 128 single + col24 | 15,432 | 14,186 | 9,913 | 30,788 | 5,442 | 10.2 |
+| 35M VBITS 128 two | 15,432 | 30,015 | 27,145 | 48,013 | 5,435 | 10.2 |
+| 35M VBITS 128 single, 6 GB cap | 15,432 | 17,379 | 16,795 | 37,694 | 5,466 | 10.2 |
+| 35M VBITS 256 single | 15,432 | 18,305 | 18,213 | 43,926 | 10,280 | 9.6 |
+| 35M VBITS 256 single + col24 | 15,432 | 15,287 | 15,195 | 40,852 | 10,224 | 9.6 |
+
+"Matrix" is the first "matrix is ... (N MB)" line, about 1.065x the file.
+At the planning step ("GPU memory:"), the three NOFIT runs held the matrix
+plus only 1.3-2.5 GB. The pinned streamed blocks and most of the host
+vectors come after that line.
+
+So the peak is the matrix, plus the streamed blocks, plus 9.6-10.2 bytes
+per column per VBITS/8, independent of size and setting. The streamed
+amount follows from the planning line: what is needed, minus the budget
+(the space for blocks less the streaming margin, 1.5 GB under WDDM,
+256 MB natively, none with `max_gpu_mem`), plus the staging buffers. The
+tune estimates staging as three buffers of 1.1x (block_nnz x 4 + columns x
+4) bytes, and the host vectors as 10.5 bytes per column per VBITS/8. On
+all 13 runs above, that ran 0.5-1.4 GB above the measured peak.
+
+`tools/tune_la.sh` now reads that line as soon as msieve logs it. A run
+whose estimated peak plus 2 GB exceeds the RAM available when it started
+is stopped before it pins anything, and recorded as NORAM with the
+breakdown. A run whose layout cannot fit on the card at all is still
+NOFIT. Tested with fake programs replaying real planning logs: in a 12 GB
+memory-limited scope, the 25M VBITS 128 single run (estimate 21.6 GB) was
+stopped, and with no limit it ran.
+
+On the 3060's 30 GiB container, the estimate would have stopped the runs
+that were killed. For example, 25M VBITS 256 two copies comes to about
+36 GB, and 35M VBITS 128 single to about 34 GB. With the 2 GB margin it
+would also have stopped 25M VBITS 128 two copies (about 29.7 GB
+estimated), which got through there, presumably with little to spare.
