@@ -140,9 +140,11 @@ eval "$(awk '
         }
         # Last resort: the highest density the merge attempted, which is not
         # necessarily the one the matrix was built at -- flag it as a guess.
+        # Older builds log "trying target density N" per density; since the
+        # shared multi-density merge, "writing cycles for target density N".
         if (!dens) {
             for (i = n; i >= 1; i--)
-                if (line[i] ~ /trying target density [0-9.]+/) {
+                if (line[i] ~ /(trying|cycles for) target density [0-9.]+/) {
                     match(line[i], /density [0-9.]+/); dens = fnum(substr(line[i], RSTART, RLENGTH))
                     guess = 1; break
                 }

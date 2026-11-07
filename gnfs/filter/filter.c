@@ -239,6 +239,75 @@ static uint32 do_merge(msieve_obj *obj, filter_t *filter,
 }
 
 /*--------------------------------------------------------------------*/
+/* Merge the relations in memory for each of several target densities
+   (in increasing order) and write msieve.dat.cyc.NNN for each one that
+   succeeds, stopping at the first that fails. Clique removal, the 2-way
+   merge and the full merge run once: target_density only decides where
+   the full merge stops, so it saves each lower target's cycles as it
+   passes them and carries on (filter_merge_full_multi). The cycles are
+   the same as separate merges from the same relations would give.
+   Returns the relations needed, as do_merge() does. */
+
+static uint32 do_merge_multi(msieve_obj *obj, filter_t *filter,
+			const double *targets, uint32 num_targets) {
+
+	uint32 d;
+	uint32 relations_needed;
+	uint32 extra_needed = filter->target_excess;
+	uint32 num_early = 0;
+	merge_t merge;
+	merge_t *early;
+	char dsuffix[32];
+	int32 status;
+
+	filter->target_excess = (uint32)(filter->target_excess *
+					FINAL_EXCESS_FRACTION);
+	if ((relations_needed = check_excess(filter)) > 0)
+		return relations_needed;
+	filter_purge_cliques(obj, filter);
+
+	memset(&merge, 0, sizeof(merge));
+	merge.num_extra_relations = NUM_EXTRA_RELATIONS;
+	filter_merge_init(obj, filter);
+	filter_merge_2way(obj, filter, &merge);
+
+	early = (merge_t *)xcalloc((size_t)num_targets, sizeof(merge_t));
+	status = filter_merge_full_multi(obj, &merge, extra_needed,
+				targets, num_targets, early, &num_early);
+	if (status != 0) {
+		if (merge.relset_array != NULL || merge.data_pool != NULL)
+			filter_free_relsets(&merge);
+		if (num_early == 0) {
+			free(early);
+			return 1000000;
+		}
+	}
+
+	/* the merge state is gone, so only the cycles remain in memory
+	   while each target is optimized and written */
+
+	for (d = 0; d < num_early; d++) {
+		logprintf(obj, "writing cycles for target density %.0f\n",
+				targets[d]);
+		filter_postproc_relsets(obj, early + d);
+		sprintf(dsuffix, ".%d", (int)(targets[d] + 0.5));
+		filter_dump_relsets(obj, early + d, dsuffix);
+		filter_free_relsets(early + d);
+	}
+	free(early);
+
+	if (status == 0) {
+		logprintf(obj, "writing cycles for target density %.0f\n",
+				targets[num_targets - 1]);
+		filter_postproc_relsets(obj, &merge);
+		sprintf(dsuffix, ".%d", (int)(targets[num_targets - 1] + 0.5));
+		filter_dump_relsets(obj, &merge, dsuffix);
+		filter_free_relsets(&merge);
+	}
+	return 0;
+}
+
+/*--------------------------------------------------------------------*/
 #define MAX_KEEP_WEIGHT 45
 
 static uint32 do_partial_filtering(msieve_obj *obj, filter_t *filter,
@@ -518,7 +587,6 @@ uint32 nfs_filter_relations(msieve_obj *obj, mpz_t n) {
 
 	nfs_write_lp_file(obj, &fb, &filter, max_relations, 0);
 	nfs_compact_lp_file(obj, &filter, ram_size);
-	/* save filter state before initial LP read for multi-density small path */
 	{
 	filter_read_lp_file(obj, &filter, 0);
 
@@ -535,80 +603,13 @@ uint32 nfs_filter_relations(msieve_obj *obj, mpz_t n) {
 				goto finished;
 		}
 		else {
-			uint32 d;
-			char dsuffix[32];
-			uint8 *saved_rel_array;
-			size_t saved_rel_bytes;
-			uint32 saved_nr, saved_ni;
-			uint32 extra_needed = filter.target_excess;
+			/* clique removal and all the merging are shared
+			   across the densities */
 
-			/* run cliques once for all densities */
-			filter.target_excess = (uint32)(filter.target_excess *
-							FINAL_EXCESS_FRACTION);
-			if ((relations_needed = check_excess(&filter)) > 0)
+			relations_needed = do_merge_multi(obj, &filter,
+						target_densities, num_densities);
+			if (relations_needed > 0)
 				goto finished;
-			filter_purge_cliques(obj, &filter);
-
-			/* save post-clique state */
-			saved_nr = filter.num_relations;
-			saved_ni = filter.num_ideals;
-			{
-				relation_ideal_t *rp = filter.relation_array;
-				uint32 k;
-				for (k = 0; k < saved_nr; k++)
-					rp = next_relation_ptr(rp);
-				saved_rel_bytes = (uint8 *)rp - (uint8 *)filter.relation_array;
-			}
-			saved_rel_array = (uint8 *)xmalloc(saved_rel_bytes);
-			memcpy(saved_rel_array, filter.relation_array, saved_rel_bytes);
-			for (d = 0; d < num_densities; d++) {
-				if (d > 0) {
-					free(filter.relation_array);
-					free(filter.relation_ptr);
-					filter.relation_array = (relation_ideal_t *)xmalloc(saved_rel_bytes);
-					memcpy(filter.relation_array, saved_rel_array, saved_rel_bytes);
-					filter.relation_ptr = (relation_ideal_t **)xmalloc(
-								saved_nr * sizeof(relation_ideal_t *));
-					{
-						relation_ideal_t *rp = filter.relation_array;
-						uint32 k;
-						for (k = 0; k < saved_nr; k++) {
-							filter.relation_ptr[k] = rp;
-							rp = next_relation_ptr(rp);
-						}
-					}
-					filter.num_relations = saved_nr;
-					filter.num_ideals    = saved_ni;
-				}
-				logprintf(obj, "trying target density %.0f\n",
-						target_densities[d]);
-				memset(&merge, 0, sizeof(merge));
-				merge.num_extra_relations = NUM_EXTRA_RELATIONS;
-				merge.target_density = target_densities[d];
-				filter_merge_init(obj, &filter);
-				filter_merge_2way(obj, &filter, &merge);
-				if (filter_merge_full(obj, &merge, extra_needed) != 0) {
-
-					/* do_merge() frees the half-built relsets before it
-					   returns; these loops have to do it themselves,
-					   and the finished: label does not */
-
-					if (merge.relset_array != NULL || merge.data_pool != NULL)
-						filter_free_relsets(&merge);
-					if (d == 0) {
-						relations_needed = 1000000;
-						free(saved_rel_array);
-						goto finished;
-					}
-					break;
-				}
-				filter_postproc_relsets(obj, &merge);
-				sprintf(dsuffix, ".%d", (int)(target_densities[d] + 0.5));
-				filter_dump_relsets(obj, &merge, dsuffix);
-				filter_free_relsets(&merge);
-				relations_needed = 0;
-			}
-			free(saved_rel_array);
 			get_filter_tmp_name(obj, lp_filename,
 					sizeof(lp_filename), ".lp");
 			remove(lp_filename);
@@ -651,82 +652,11 @@ uint32 nfs_filter_relations(msieve_obj *obj, mpz_t n) {
 				}
 			}
 			else {
-				uint32 d;
-				char dsuffix[32];
-				uint8 *saved_rel_array;
-				size_t saved_rel_bytes;
-				uint32 saved_nr, saved_ni;
-				uint32 extra_needed;
 				filter_read_lp_file(obj, &filter, 0);
-				extra_needed = filter.target_excess;
-
-				/* run cliques once for all densities */
-				filter.target_excess = (uint32)(filter.target_excess *
-								FINAL_EXCESS_FRACTION);
-				if ((relations_needed = check_excess(&filter)) > 0)
+				relations_needed = do_merge_multi(obj, &filter,
+						target_densities, num_densities);
+				if (relations_needed > 0)
 					goto finished;
-				filter_purge_cliques(obj, &filter);
-
-				/* save post-clique state */
-				saved_nr = filter.num_relations;
-				saved_ni = filter.num_ideals;
-				{
-					relation_ideal_t *rp = filter.relation_array;
-					uint32 k;
-					for (k = 0; k < saved_nr; k++)
-						rp = next_relation_ptr(rp);
-					saved_rel_bytes = (uint8 *)rp - (uint8 *)filter.relation_array;
-				}
-				saved_rel_array = (uint8 *)xmalloc(saved_rel_bytes);
-				memcpy(saved_rel_array, filter.relation_array, saved_rel_bytes);
-				for (d = 0; d < num_densities; d++) {
-					if (d > 0) {
-						free(filter.relation_array);
-						free(filter.relation_ptr);
-						filter.relation_array = (relation_ideal_t *)xmalloc(saved_rel_bytes);
-						memcpy(filter.relation_array, saved_rel_array, saved_rel_bytes);
-						filter.relation_ptr = (relation_ideal_t **)xmalloc(
-									saved_nr * sizeof(relation_ideal_t *));
-						{
-							relation_ideal_t *rp = filter.relation_array;
-							uint32 k;
-							for (k = 0; k < saved_nr; k++) {
-								filter.relation_ptr[k] = rp;
-								rp = next_relation_ptr(rp);
-							}
-						}
-						filter.num_relations = saved_nr;
-						filter.num_ideals    = saved_ni;
-					}
-					logprintf(obj, "trying target density %.0f\n",
-							target_densities[d]);
-					memset(&merge, 0, sizeof(merge));
-					merge.num_extra_relations = NUM_EXTRA_RELATIONS;
-					merge.target_density = target_densities[d];
-					filter_merge_init(obj, &filter);
-					filter_merge_2way(obj, &filter, &merge);
-					if (filter_merge_full(obj, &merge, extra_needed) != 0) {
-
-						/* do_merge() frees the half-built relsets before it
-						   returns; these loops have to do it themselves,
-						   and the finished: label does not */
-
-						if (merge.relset_array != NULL || merge.data_pool != NULL)
-							filter_free_relsets(&merge);
-						if (d == 0) {
-							relations_needed = 1000000;
-							free(saved_rel_array);
-							goto finished;
-						}
-						break;
-					}
-					filter_postproc_relsets(obj, &merge);
-					sprintf(dsuffix, ".%d", (int)(target_densities[d] + 0.5));
-					filter_dump_relsets(obj, &merge, dsuffix);
-					filter_free_relsets(&merge);
-					relations_needed = 0;
-				}
-				free(saved_rel_array);
 				get_filter_tmp_name(obj, lp_filename,
 						sizeof(lp_filename), ".lp");
 				remove(lp_filename);

@@ -119,8 +119,9 @@ There are three internal code paths based on data size relative to RAM:
 Extensions added for NFS@Home distributed factoring workflows, all controlled via the `-nc1`/`-nc2` argument string:
 
 **Multi-density filtering** (`gnfs/filter/filter.c`):
-- `target_density=80,100,120` — comma-separated list; densities are sorted numerically, merged independently, each written to `msieve.dat.cyc.80` / `.cyc.100` / `.cyc.120`; stops at first failure
-- The post-singleton in-memory `relation_array` is deep-copied after the first merge and restored from memory (not re-read from disk) for each subsequent density
+- `target_density=80,100,120` — comma-separated list; densities are sorted numerically, each written to `msieve.dat.cyc.80` / `.cyc.100` / `.cyc.120`; stops at first failure
+- In the small and medium paths, clique removal, the 2-way merge and the full merge run once for all densities (`do_merge_multi`, `filter_merge_full_multi` in `common/filter/merge.c`). `target_density` is only the full merge's stopping test (`avg_cycle_weight >= target_density` when the active heap empties), so the merge for the highest density passes through the exact state where each lower one stops; `save_cycles` copies that state's cycles into their own `merge_t` and pool and finishes them as a separate merge would. Cycle optimization and the `.cyc.NNN` writes run after the merge, once its state is freed. The `.cyc.NNN` files match separate per-density merges. The large (partial) path still filters each density separately, since whether a `max_weight` attempt is accepted depends on its density
+- Log: one "commencing 2-way merge" / "commencing full merge", then "saving cycles for target density N" as each lower density is passed, "finishing cycles for target density N" for the last, and "writing cycles for target density N" before each cycle optimization (older builds logged "trying target density N" per density; `report_job.sh` accepts both)
 
 **Multi-density matrix build** (`gnfs/gf2.c`):
 - `all_matbuild=1` — scans for `.cyc.NNN` files, builds a `.mat.NNN` (and `.mat.idx.NNN`) for each; implies `only_matbuild=1`

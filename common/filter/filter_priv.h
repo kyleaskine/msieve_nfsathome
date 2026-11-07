@@ -244,6 +244,21 @@ void filter_merge_2way(msieve_obj *obj, filter_t *filter, merge_t *merge);
 
 int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles);
 
+/* one full merge for several target densities, given in increasing
+   order. target_density only decides where a merge stops, so the merge
+   for the last target passes through the state where each earlier one
+   would stop; that state's cycles are saved into early[0, *num_early),
+   each with its own payload pool, and the last target's cycles are left
+   in merge. Returns nonzero if a target fails (or the merge does before
+   reaching it); the targets in early[] up to that point are still
+   valid. Each early[] entry and merge must go to filter_free_relsets()
+   in the end. */
+
+int32 filter_merge_full_multi(msieve_obj *obj, merge_t *merge,
+			uint32 min_cycles, const double *targets,
+			uint32 num_targets, merge_t *early,
+			uint32 *num_early);
+
 #ifdef __cplusplus
 }
 #endif

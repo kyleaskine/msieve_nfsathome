@@ -353,7 +353,163 @@ static int set_merge_cycle_targets(msieve_obj *obj, uint32 min_cycles,
 	return 0;
 }
 
-int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
+/*--------------------------------------------------------------------*/
+/* The end of a merge, once its cycles are compacted into
+   merge->relset_array[0, num_cycles): sort them by weight, keep the
+   lightest target_cycles, and report on them. Returns nonzero if they
+   cannot make a matrix. */
+
+static int32 finish_cycles(msieve_obj *obj, merge_t *merge,
+			uint32 num_cycles, uint32 unmerged_ideals,
+			uint32 target_cycles) {
+
+	uint32 i;
+	relation_set_t *relset_array = merge->relset_array;
+	uint64 total_cycle_weight = 0;
+	uint32 cycle_bins[NUM_CYCLE_BINS + 2] = {0};
+	uint32 max_cycles;
+
+	merge->num_relsets = num_cycles;
+	merge->num_ideals = unmerged_ideals;
+
+	logprintf(obj, "found %u cycles, need %u\n",
+				num_cycles, target_cycles);
+
+	if (num_cycles < 0.8 * target_cycles) {
+		logprintf(obj, "too few cycles, matrix probably "
+				"cannot build\n");
+		return 1;
+	}
+
+	qsort(relset_array, (size_t)num_cycles,
+			sizeof(relation_set_t), compare_relsets);
+
+	/* keep only the minimum possible number of
+	   the lightest cycles */
+
+	for (i = target_cycles; i < num_cycles; i++) {
+		relation_set_t *r = relset_array + i;
+		merge_relset_free(merge->data_pool, r);
+	}
+	num_cycles = MIN(target_cycles, num_cycles);
+	merge->num_relsets = num_cycles;
+	merge->num_ideals = unmerged_ideals;
+
+	merge->relset_array = relset_array =
+			(relation_set_t *)xrealloc(relset_array, num_cycles *
+						sizeof(relation_set_t));
+
+	/* print statistics on the final collection of cycles */
+
+	for (i = max_cycles = 0; i < num_cycles; i++) {
+		relation_set_t *r = relset_array + i;
+		total_cycle_weight += r->num_small_ideals;
+		max_cycles = MAX(max_cycles, r->num_relations);
+
+		if (r->num_relations > NUM_CYCLE_BINS)
+			cycle_bins[NUM_CYCLE_BINS+1]++;
+		else
+			cycle_bins[r->num_relations]++;
+	}
+
+	if (num_cycles == 0) {
+		logprintf(obj, "error: merge produced no cycles\n");
+		return 1;
+	}
+	merge->avg_cycle_weight = (double)total_cycle_weight / num_cycles;
+	merge->max_relations = max_cycles;
+	logprintf(obj, "weight of %u cycles is about %" PRIu64
+			" (%.2f/cycle)\n",
+			num_cycles, total_cycle_weight,
+			merge->avg_cycle_weight);
+	logprintf(obj, "distribution of cycle lengths:\n");
+	for (i = 1; i < NUM_CYCLE_BINS + 1; i++)
+		logprintf(obj, "%u relations: %u\n", i, cycle_bins[i]);
+	logprintf(obj, "%u+ relations: %u\n", i, cycle_bins[i]);
+	logprintf(obj, "heaviest cycle: %u relations\n", max_cycles);
+	return 0;
+}
+
+/*--------------------------------------------------------------------*/
+/* The merge is about to carry on toward a higher target density from a
+   state where a merge aimed at a lower one would have stopped. Copy the
+   cycles that exist now into *out, with its own payload pool, and finish
+   them there exactly as that merge would have. The copies keep their
+   order, and compare_relsets only looks at weights, so the sort sees the
+   same input and the same lightest target_cycles survive. The merge
+   state is not changed. */
+
+static int32 save_cycles(msieve_obj *obj, merge_t *merge,
+			relation_set_t *relset_array, uint32 num_relsets,
+			ideal_list_t *ideal_list, uint32 unmerged_ideals,
+			uint32 target_cycles, double target_density,
+			merge_t *out) {
+
+	uint32 i, j;
+	uint32 num_cycles = 0;
+	int32 status;
+
+	logprintf(obj, "memory use: %.1f MB\n", (double)
+			get_merge_memuse(relset_array, num_relsets,
+						ideal_list) / 1048576);
+
+	for (i = 0; i < num_relsets; i++) {
+		relation_set_t *r = relset_array + i;
+
+		if (r->data && relation_set_num_active(r) == 0)
+			num_cycles++;
+	}
+
+	memset(out, 0, sizeof(merge_t));
+	out->num_extra_relations = merge->num_extra_relations;
+	out->target_density = target_density;
+	out->data_pool = merge_mem_pool_create();
+	out->relset_array = (relation_set_t *)xmalloc(
+				(size_t)MAX(num_cycles, 1) *
+				sizeof(relation_set_t));
+
+	for (i = j = 0; i < num_relsets; i++) {
+		relation_set_t *r = relset_array + i;
+		relation_set_t *new_r;
+		uint32 small_total;
+
+		if (r->data == NULL || relation_set_num_active(r) != 0)
+			continue;
+
+		small_total = (uint32)r->num_small_ideals +
+				r->num_large_ideals;
+		if (small_total > UINT16_MAX) {
+			logprintf(obj, "error: cycle small-ideal count exceeds 16 bits\n");
+			exit(-1);
+		}
+		new_r = out->relset_array + j++;
+		*new_r = *r;
+		new_r->num_small_ideals = (uint16)small_total;
+		new_r->num_large_ideals = 0;
+		new_r->data = merge_relset_alloc(out->data_pool, new_r,
+						new_r->num_relations);
+		if (new_r->num_relations)
+			memcpy(new_r->data, r->data, (size_t)new_r->num_relations *
+						sizeof(uint32));
+	}
+	out->num_relsets = num_cycles;
+
+	status = finish_cycles(obj, out, num_cycles,
+				unmerged_ideals, target_cycles);
+	if (status != 0)
+		filter_free_relsets(out);
+	return status;
+}
+
+/*--------------------------------------------------------------------*/
+/* The full merge, for num_targets target densities in increasing order.
+   The last one is finished in merge itself; each earlier one is saved
+   into early[] when the merge passes it, and *num_early counts those. */
+
+static int32 merge_full_core(msieve_obj *obj, merge_t *merge,
+			uint32 min_cycles, const double *targets,
+			uint32 num_targets, merge_t *early,
+			uint32 *num_early) {
 
 	/* The core of the NFS merge phase; this routine starts
 	   with a collection of relation sets, each containing entries
@@ -450,11 +606,10 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 	heap_t inactive_heap;
 	ideal_list_t ideal_list;
 	merge_aux_t *aux;
-	uint64 total_cycle_weight = 0;
-	uint32 cycle_bins[NUM_CYCLE_BINS + 2] = {0};
-	uint32 max_cycles;
+	uint32 next_target = 0;
 	int32 status = 0;
 
+	*num_early = 0;
 	logprintf(obj, "commencing full merge\n");
 
 	relset_array = merge->relset_array;
@@ -524,7 +679,30 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 							&mat_weight,
 							target_cycles) /
 							target_cycles;
-				if (avg_cycle_weight >= merge->target_density)
+
+				/* target_density is only ever used in this
+				   test, so a merge aimed at a higher target
+				   passes through exactly the state where one
+				   aimed at a lower target stops. Save the
+				   lower target's cycles and carry on */
+
+				while (next_target + 1 < num_targets &&
+				       avg_cycle_weight >= targets[next_target]) {
+					logprintf(obj, "saving cycles for target "
+						"density %.0f\n",
+						targets[next_target]);
+					if (save_cycles(obj, merge, relset_array,
+							num_relsets, &ideal_list,
+							unmerged_ideals,
+							target_cycles,
+							targets[next_target],
+							early + next_target) != 0) {
+						status = 1;
+						goto clean_up;
+					}
+					*num_early = ++next_target;
+				}
+				if (avg_cycle_weight >= targets[next_target])
 					break;
 			}
 
@@ -625,6 +803,26 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 		}
 	}
 
+	/* if the merge ran out of ideals to merge, a separate
+	   merge for each target not yet reached would have ended
+	   in this same state */
+
+	while (next_target + 1 < num_targets) {
+		logprintf(obj, "saving cycles for target density %.0f\n",
+				targets[next_target]);
+		if (save_cycles(obj, merge, relset_array, num_relsets,
+				&ideal_list, unmerged_ideals, target_cycles,
+				targets[next_target],
+				early + next_target) != 0) {
+			status = 1;
+			goto clean_up;
+		}
+		*num_early = ++next_target;
+	}
+	if (num_targets > 1)
+		logprintf(obj, "finishing cycles for target density %.0f\n",
+				targets[next_target]);
+
 	/* merging has finished; delete relation sets that
 	   are not cycles, then sort in order of increasing
 	   cycle weight */
@@ -663,63 +861,8 @@ int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
 	merge->num_relsets = num_cycles;
 	merge->num_ideals = unmerged_ideals;
 
-	logprintf(obj, "found %u cycles, need %u\n",
-				num_cycles, target_cycles);
-
-	if (num_cycles < 0.8 * target_cycles) {
-		logprintf(obj, "too few cycles, matrix probably "
-				"cannot build\n");
-		status = 1;
-		goto clean_up;
-	}
-
-	qsort(relset_array, (size_t)num_cycles,
-			sizeof(relation_set_t), compare_relsets);
-
-	/* keep only the minimum possible number of
-	   the lightest cycles */
-
-	for (i = target_cycles; i < num_cycles; i++) {
-		relation_set_t *r = relset_array + i;
-		merge_relset_free(merge->data_pool, r);
-	}
-	num_cycles = MIN(target_cycles, num_cycles);
-	merge->num_relsets = num_cycles;
-	merge->num_ideals = unmerged_ideals;
-
-	merge->relset_array = relset_array =
-			(relation_set_t *)xrealloc(relset_array, num_cycles *
-						sizeof(relation_set_t));
-
-	/* print statistics on the final collection of cycles */
-
-	for (i = max_cycles = 0; i < num_cycles; i++) {
-		relation_set_t *r = relset_array + i;
-		total_cycle_weight += r->num_small_ideals;
-		max_cycles = MAX(max_cycles, r->num_relations);
-
-		if (r->num_relations > NUM_CYCLE_BINS)
-			cycle_bins[NUM_CYCLE_BINS+1]++;
-		else
-			cycle_bins[r->num_relations]++;
-	}
-
-	if (num_cycles == 0) {
-		logprintf(obj, "error: merge produced no cycles\n");
-		status = 1;
-		goto clean_up;
-	}
-	merge->avg_cycle_weight = (double)total_cycle_weight / num_cycles;
-	merge->max_relations = max_cycles;
-	logprintf(obj, "weight of %u cycles is about %" PRIu64
-			" (%.2f/cycle)\n",
-			num_cycles, total_cycle_weight,
-			merge->avg_cycle_weight);
-	logprintf(obj, "distribution of cycle lengths:\n");
-	for (i = 1; i < NUM_CYCLE_BINS + 1; i++)
-		logprintf(obj, "%u relations: %u\n", i, cycle_bins[i]);
-	logprintf(obj, "%u+ relations: %u\n", i, cycle_bins[i]);
-	logprintf(obj, "heaviest cycle: %u relations\n", max_cycles);
+	status = finish_cycles(obj, merge, num_cycles,
+				unmerged_ideals, target_cycles);
 
 	/* clean up */
 clean_up:
@@ -730,4 +873,37 @@ clean_up:
 	merge_aux_free(aux);
 	free(aux);
 	return status;
+}
+
+/*--------------------------------------------------------------------*/
+int32 filter_merge_full(msieve_obj *obj, merge_t *merge, uint32 min_cycles) {
+
+	uint32 num_early;
+
+	return merge_full_core(obj, merge, min_cycles,
+				&merge->target_density, 1, NULL, &num_early);
+}
+
+/*--------------------------------------------------------------------*/
+int32 filter_merge_full_multi(msieve_obj *obj, merge_t *merge,
+			uint32 min_cycles, const double *targets,
+			uint32 num_targets, merge_t *early,
+			uint32 *num_early) {
+
+	uint32 i;
+
+	if (num_targets == 0) {
+		logprintf(obj, "error: no target densities to merge for\n");
+		exit(-1);
+	}
+	for (i = 1; i < num_targets; i++) {
+		if (targets[i] < targets[i - 1]) {
+			logprintf(obj, "error: target densities must be "
+					"in increasing order\n");
+			exit(-1);
+		}
+	}
+	merge->target_density = targets[num_targets - 1];
+	return merge_full_core(obj, merge, min_cycles, targets,
+				num_targets, early, num_early);
 }

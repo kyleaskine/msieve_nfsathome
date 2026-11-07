@@ -2494,7 +2494,7 @@ estimated), which got through there, presumably with little to spare.
 
 207-digit GNFS (degree 5), 925.1M unique relations, filtered with
 `target_density=90,110,130 all_matbuild=1` (filtering 4h09m, builds about an
-hour). The job itself goes to the 5090. These timings are for comparison.
+hour). The job itself went to the 5090. These timings are for comparison.
 `bench_la.sh -W 30 -T 90 -- -t 8` with the root `./msieve` (VBITS 128, built
 Oct 11 15:01, sha256 f25a6b6c...), single copy + col24. VBITS 256 cannot fit
 its vectors on this card at these sizes (10-11.4 GB). All runs passed the
@@ -2541,7 +2541,7 @@ TD 130 again, same binary and window:
 
 ### C207 TD 130 on the 5090
 
-The job itself runs on the rented 5090 (32 GB, native Linux, 256 MB
+The job itself ran on the rented 5090 (32 GB, native Linux, 256 MB
 streaming margin). `bench_la.sh -T 90`, default warmup and threads, binaries
 built there from the current source at VBITS 128 and 256. All runs passed
 the integrity check.
@@ -2564,6 +2564,28 @@ the integrity check.
   and lost by 24%.
 - The pre-run estimate from the C199 (700-730 dims/s for VBITS 256 single +
   col24) came out 2-6% high.
+
+Production run (October 13-14): VBITS 256, single copy + col24, `-t 8` on
+the 5090. 8 of 45 blocks streamed (3,980 MB through two 498 MB buffers),
+with 5,970.5 MiB uploaded in 12 copies per iteration, identical to the
+benchmark (about 15.7 GiB/s). msieve logged 30.7 GB of host memory. Lanczos
+ran from 20:11:00 to 15:08:44 (the rented machine's clock, UTC): 18h57m44s
+over 183,243 iterations, 685.1 dims/s and 372.5 ms/iteration, 0.2% below
+the benchmark's 686.4 (it predicted 18h55m; msieve's ETA at 0.1% said
+19h04m). BLanczosTime was 68,547 s (19h02m27s), including 1m36s to load
+and pin the matrix and 3m06s to recover 29 dependencies. The 5070's best
+setting (col24 + row16 + host_check, 76h04m) would have taken 4.0x as long.
+
+The square root ran on the local machine: about 37 minutes per dependency
+for 85.6M relations (2.5-4.5 min reading, 11-13 min multiplying to about
+5,562 million-bit coefficients, 19-24 min for the square root). Dependency
+1 gave "GCD is N"; dependency 2 split N (sqrtTime 4,464 s, 1h14m24s):
+3482921967359364153287531538446637304965598553237680527627152267251859448511943 *
+46552948899867336846094046648511274651673021789252645627418864951886041124713015469037049214853231752344767088708017434492859687
+(p79 x p128). From the 1,301.4M raw relations (28.9% duplicates), the job
+took about 25.5 hours of compute after sieving: filtering 4h09m, three
+matrix builds 1h02m, Lanczos 19h02m, square root 1h14m, not counting the
+17.4 GB archive's transfer to the 5090.
 
 ### RTX 3080 default tune (someone else's, WSL)
 
@@ -2608,3 +2630,155 @@ At 35M and 45M every run was NORAM or NOFIT.
   the tune keeps 2 GB to spare.
 - In the report, a NORAM row's host RAM is only what loaded before the
   stop. The estimate that triggered the stop is only in `runs.log`.
+
+## 2026-10-20: C203 TD 110 production solve on the RTX 5090
+
+Completed October 19-20. The unsuffixed matrix was TD 110. Source log,
+polynomial, input, original job label, SHA-256 manifest and calculated
+summary are preserved in `bench/c203-production-20261020/` (local,
+gitignored). The original `jobname.txt` still said `C207_2712_2082`; the
+input and log identify this as C203. The log concatenates the rented
+machine's LA timestamps and the local square-root timestamps, so use
+individual phase durations rather than subtracting across machines.
+
+Filtering processed 1,240,839,060 raw relations, added 121,594 free
+relations, and found 337,704,682 duplicates, leaving 903,255,972 unique
+relations. Filtering for TD 90/110/130 took 18,037 s (5h00m37s), and
+building all three matrices took 4,115 s (1h08m35s).
+
+| TD | Rows | Columns | Sparse nonzeros | Sparse nonzeros/col | Loaded matrix (logged MB) |
+|---|---:|---:|---:|---:|---:|
+| 90 | 50,046,159 | 50,046,338 | 4,331,497,449 | 86.55 | 18,814.3 |
+| 110 | 46,508,730 | 46,508,911 | 4,845,417,313 | 104.18 | 20,612.8 |
+| 130 | 43,978,922 | 43,979,102 | 5,341,907,657 | 121.46 | 22,391.0 |
+
+Production used the rented RTX 5090, VBITS 256, 8 threads,
+`skip_matbuild=1 single_copy=1 col24=1`. The log confirms these settings;
+the remote binary hash and complete command line were not captured.
+After saving the first 240 rows and packing 256 dense rows, TD 110 had
+46,508,490 rows, 46,508,911 columns and 4,233,030,807 sparse nonzeros
+(91.02/col), with a logged matrix size of 18,986.4 MB.
+
+- Automatic `block_nnz` was 95,436,646, using the 96 MiB L2 heuristic.
+  All 45 blocks selected segscan; all used col24 and none used row16.
+  Col24 saved 4,036.9 MiB across the blocks.
+- The entire matrix stayed resident: the planner logged 31,588 MB free,
+  9,935 MB for vectors, and 20,233 MB available for sparse blocks versus
+  20,185 MB needed. There were no streamed blocks or transfer summary.
+  The sparse budget had only about 48 MB to spare. The reported host
+  memory use at iteration start was 31,449.2 MB.
+- Lanczos iteration ran from October 19 18:10:15 to October 20 11:57:20:
+  **17h47m05s**, 182,219 iterations, final dimension 46,508,489,
+  **726.4 dims/s** and **351.4 ms/iteration**. These rates include the
+  checks and checkpoints during the iteration interval.
+- `BLanczosTime` was **64,339 s (17h52m19s)**, including 2m51s before
+  iteration and about 2m23s afterward. It recovered **32 nontrivial
+  dependencies**. The early ETA was 18h07m, about 20 minutes longer than
+  the actual iteration interval.
+
+This landed within the earlier 16-19 hour estimate. It was 6.0% faster
+in dims/s than the C207 TD 130 production run (685.1 dims/s), which
+streamed about 4 GB. Both density and residency differ, so this is not
+an isolated measurement of the cost of streaming. TD 90 and TD 130 were
+built but have no LA timings in this production log.
+
+The local square root succeeded on dependency 1: 23,256,257 cycles and
+81,028,750 unique relations, with product coefficients about 5,238.95
+million bits long. `sqrtTime` was 2,953 s (49m13s), elapsed 49m14s.
+The log reports p78 x p125:
+
+```
+631444815958800080134277992677257604086384616135706742760688647408500718438841
+16361533155977412310641543821485068799372787986212734137061263770163508468123001075397899317723102414092835483725892164801381
+```
+
+Their product was independently checked against the C203 input:
+
+```
+10331405292479962561742561400615171827471843946457419934883400432602722353187713762996675834989339962281307315132723292655538427632371383318852198079807282832334613025638522582183817647199709385160839421
+```
+
+Total recorded phase time after sieving was 89,444 s (**24h50m44s**):
+filtering, all three matrix builds, the TD 110 solve and square root.
+This excludes archive creation, transfers and time between runs.
+
+## 2026-10-21: RTX 3080 production solve, 20.8M dims (someone else's, WSL)
+
+The same 10 GB 3080 as the October 13 tune (WDDM: msieve left its 1536 MB
+margin). VBITS 256, `single_copy=1 col24=1 host_check=1`, no row16. The
+matrix had 95.14 sparse nonzeros/col before packing. After saving 240
+rows and packing 256: 20,820,182 x 20,820,599, 1,717,828,701 sparse
+nonzeros (82.51/col).
+
+- block_nnz 41,640,364: the 2*nrows floor (5 MiB L2), with the
+  slower-than-two-copies note. 42 blocks, all segscan, all col24
+  (1638.2 MiB saved), none row16.
+- 9069 MB free, 3812 MB for vectors, 4621 MB for sparse blocks, 8335 MB
+  needed: 29 of 42 blocks (5669 MB) streamed through 2 buffers of 199 MB.
+- Lanczos iteration 13:40:20 to 14:41:23 the next day: **25h01m03s**,
+  81,573 iterations, **1.104 s/iteration, 231.2 dims/s**. The 0.1% ETA
+  said 24h53m. BLanczosTime 91,562 s, 31 dependencies.
+- Transfers: 10,633.2 MiB and 54 copies per iteration (2 x 29 - 4), 1.88
+  uploads per streamed byte (C207: 1.9-2). That is **9.4 GiB/s (10.1
+  GB/s)**.
+- He also started the same options at VBITS 128: ETA 31h (about 0.68
+  s/iteration), not run to the end.
+
+Before the run, a model of `plan_matrix`/`choose_streamed` (equal-size
+blocks, 8 vectors off the top or 7 with host_check, the WDDM margin)
+estimated each setting, assuming ~9250 MB free and an 11 GiB/s link
+(from the tune's 25M run). With the actual 9069 MB it reproduces this
+layout: 8335 MB needed, 29 of 42 streamed (5697 MiB modeled). For this
+setting it predicted ~23-25h, close to the actual 25h. It also predicted
+two copies + col24 + host_check at 18-20h and recommended that.
+
+- The copy rate matches the October 13 tune's 14M two + col24 run
+  (modeled ~5 GiB per 0.522 s iteration, ~9.5 GiB/s). So ~9.4-9.5 GiB/s
+  is probably this gen 3 link's practical ceiling, not 11, and this run
+  was copy-bound or nearly so. Scaling the tune's 14M single + col24 run
+  (0.692 s, kernel-bound) by nonzeros and blocks x rows gives ~0.94 s of
+  kernel time here.
+- At 9.4 GiB/s, the modeled alternatives (not measured):
+
+| Setting (VBITS 256, host_check=1) | Streamed | Uploads/iter | Copy floor | Est. LA |
+|---|---:|---:|---:|---:|
+| single + col24 (this run) | 29/42, 5697 MiB | 10.4 GiB | 1.11 s | 25h (actual) |
+| single + col24 + row16 | 25/42, 3934 MiB | 7.2 GiB | 0.77 s | ~23-24h: kernel-bound at ~0.94 s plus row16 decoding |
+| two + col24 | 13/14, 10160 MiB | 9.9 GiB | 1.06 s | ~24h |
+| two + col24 + row16 | 12/14, 8909 MiB | 8.7 GiB | 0.93 s | ~21h, if its kernels (~0.63-0.72 s at 7M/14M scaling) stay under the copies |
+
+- So the 18-20h two-copy prediction does not hold at this link rate; plain
+  two copies would have been about the same as this run. Only two copies
+  + col24 + row16 + host_check looks better (~21h), untested.
+- The VBITS 128 ETA (0.68 s) beats the model's copy floor at 9.4 GiB/s
+  (7.25 GiB, 0.77 s). Either that run had more free memory (unknown) or
+  the model's VBITS 128 nonzero count (estimated by scaling C191's
+  packing) is too high. Not resolved.
+- A gen 4 link would roughly halve every copy floor above, leaving this
+  run kernel-bound (~0.94 s, ~21h) and two copies at ~15-17h.
+
+## 2026-11-06: One shared merge for all target densities
+
+`target_density` is only the full merge's stopping test, so the merge for
+the highest density passes through the exact state where each lower one
+stops. `filter_merge_full_multi` saves each lower density's cycles there
+and carries on. Clique removal, the 2-way merge and the full merge now run
+once for the small and medium paths; the large (partial) path is
+unchanged. Details are in CLAUDE.md (multi-density filtering).
+
+Validation: a C146 aliquot job (AS9336 i1251, 8.6 GB `msieve.dat`), old and
+new CPU builds run side by side with `-t 8` on a machine with two other busy
+processes:
+
+| Run | Result | Merge stage (old -> new) | RelProcTime (old -> new) |
+|---|---|---|---|
+| small path, TD 70,90,110 | all three `.cyc.NNN` byte-identical | 5m21s -> 3m06s | 606 -> 473 s |
+| medium path (`filter_mem_mb=14000`), TD 70,90,110 | 70 and 90 identical; 110 fails in both ("found 207878 cycles, need 1798649") | 6m12s -> 3m39s | 686 -> 535 s |
+| single TD 90 | identical; log identical except random seeds | (unchanged path) | 379 -> 378 s |
+
+The single TD 90 `.cyc` is also identical to the multi run's `.cyc.90`: the
+shared merge gives what a separate merge gives. On the C203 log (three
+densities, 2h10m from the 2-way merge to the last cycle optimization), the
+expected saving is about an hour: one 2-way merge instead of three, and one
+full merge (the TD 130 one, 34 min) instead of 89 minutes of them. The three
+cycle optimizations (34 min) still run one after another.
